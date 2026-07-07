@@ -52,15 +52,70 @@ async function connectTrueNAS(config) {
   }
 }
 
+// Reconnects with exponential backoff whenever there's no live TrueNAS
+// connection — both on initial failure and after a later disconnect (the
+// client's WebSocket can drop on a TrueNAS reboot or LAN blip at any time,
+// and this app is meant to run unattended, including a 4am cron job).
+// Mutates `ctx.adapter` in place; routes/services read `ctx.adapter` live
+// per-call rather than capturing it once, so this propagates everywhere.
+const RECONNECT_MIN_MS = 2000;
+const RECONNECT_MAX_MS = 30000;
+
+function startReconnectLoop(ctx, holder) {
+  let backoffMs = RECONNECT_MIN_MS;
+  let stopped = false;
+  let timer = null;
+
+  function onDisconnected() {
+    if (stopped) return;
+    console.error('[server] TrueNAS connection dropped; will retry with backoff');
+    ctx.adapter = null;
+    scheduleAttempt();
+  }
+
+  async function attempt() {
+    if (stopped) return;
+    try {
+      const { client, adapter } = await connectTrueNAS(ctx.config);
+      holder.client = client;
+      ctx.adapter = adapter;
+      backoffMs = RECONNECT_MIN_MS;
+      console.log('[server] TrueNAS (re)connected and resolved RPC methods');
+      client.on('disconnected', onDisconnected);
+    } catch (err) {
+      console.error(`[server] TrueNAS reconnect attempt failed: ${err.message}`);
+      scheduleAttempt();
+    }
+  }
+
+  function scheduleAttempt() {
+    if (stopped) return;
+    clearTimeout(timer);
+    timer = setTimeout(attempt, backoffMs);
+    backoffMs = Math.min(backoffMs * 2, RECONNECT_MAX_MS);
+  }
+
+  return {
+    onInitialFailure: scheduleAttempt,
+    attachTo(client) {
+      client.on('disconnected', onDisconnected);
+    },
+    stop() {
+      stopped = true;
+      clearTimeout(timer);
+    },
+  };
+}
+
 async function main() {
   const config = loadConfig();
   const db = initDb(config.dbPath);
 
-  let truenasClient = null;
+  const holder = { client: null };
   let adapter = null;
   try {
     const connected = await connectTrueNAS(config);
-    truenasClient = connected.client;
+    holder.client = connected.client;
     adapter = connected.adapter;
     console.log('[server] connected to TrueNAS and resolved RPC methods');
   } catch (err) {
@@ -71,6 +126,12 @@ async function main() {
   }
 
   const ctx = { db, adapter, config };
+  const reconnect = startReconnectLoop(ctx, holder);
+  if (holder.client) {
+    reconnect.attachTo(holder.client);
+  } else {
+    reconnect.onInitialFailure();
+  }
 
   const app = express();
   app.use(express.json());
@@ -95,7 +156,17 @@ async function main() {
 
   app.get('/api/events', (req, res) => {
     try {
-      const limit = req.query.limit ? parseInt(req.query.limit, 10) : 100;
+      // parseInt('abc') is NaN, which better-sqlite3 rejects as a bind param
+      // (500 instead of a clean 400); a negative/zero LIMIT in SQLite means
+      // "no limit" and would return the entire table. Validate and clamp.
+      let limit = 100;
+      if (req.query.limit !== undefined) {
+        const parsed = parseInt(req.query.limit, 10);
+        if (!Number.isInteger(parsed) || parsed <= 0) {
+          return res.status(400).json({ error: 'limit must be a positive integer' });
+        }
+        limit = Math.min(parsed, 1000);
+      }
       return res.status(200).json(listEvents(db, { limit }));
     } catch (err) {
       return res.status(500).json({ error: err.message });
@@ -103,7 +174,10 @@ async function main() {
   });
 
   const stopPoller = startSessionPoller(ctx);
-  const stopScheduler = startScheduler(ctx);
+  const scheduler = startScheduler(ctx);
+  // Read live per-request by the settings route, not destructured at startup,
+  // so a later settings change can still trigger a reschedule.
+  ctx.rescheduleCron = scheduler.reschedule;
 
   const server = app.listen(config.httpPort, config.httpBind, () => {
     console.log(
@@ -114,12 +188,13 @@ async function main() {
 
   const shutdown = async (signal) => {
     console.log(`[server] received ${signal}, shutting down`);
+    reconnect.stop();
     stopPoller();
-    stopScheduler();
+    scheduler.stop();
     server.close();
-    if (truenasClient) {
+    if (holder.client) {
       try {
-        await truenasClient.close();
+        await holder.client.close();
       } catch (_) {
         // already closing/closed
       }

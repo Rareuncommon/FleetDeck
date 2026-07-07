@@ -2,8 +2,8 @@ CREATE TABLE IF NOT EXISTS clients (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
   mac TEXT NOT NULL UNIQUE,            -- normalized aa:bb:cc:dd:ee:ff
-  zvol TEXT NOT NULL,                  -- e.g. Main_pool/iscsi/client01
-  target_name TEXT NOT NULL,
+  zvol TEXT NOT NULL UNIQUE,           -- e.g. Main_pool/iscsi/client01
+  target_name TEXT NOT NULL UNIQUE,
   golden_snapshot TEXT NOT NULL,       -- e.g. gold-v2
   raw_override TEXT,                   -- optional per-client raw ipxe template override
   boot_golden_once INTEGER NOT NULL DEFAULT 0, -- toggle: serve win-golden target next boot, then auto-revert

@@ -15,11 +15,15 @@ function nextVersionLabel(snapshots) {
 
 function createGoldenRouter(ctx) {
   const router = express.Router();
-  const { db, adapter, config } = ctx;
+  // db/config never change after startup, but ctx.adapter can be replaced by
+  // a reconnect after a TrueNAS disconnect — read it fresh per request rather
+  // than destructuring it once here, or a reconnect would never be seen.
+  const { db, config } = ctx;
 
   router.get('/api/golden/snapshots', async (req, res) => {
     try {
-      const snapshots = await adapter.listGoldenSnapshots(config.goldenZvol);
+      if (!ctx.adapter) return res.status(500).json({ error: 'TrueNAS adapter unavailable' });
+      const snapshots = await ctx.adapter.listGoldenSnapshots(config.goldenZvol);
       const clients = listClients(db);
       const annotated = snapshots.map((snap) => ({
         ...snap,
@@ -38,7 +42,8 @@ function createGoldenRouter(ctx) {
       const body = req.body || {};
       let label = body.versionLabel;
       if (!label) {
-        const snapshots = await adapter.listGoldenSnapshots(config.goldenZvol);
+        if (!ctx.adapter) return res.status(500).json({ error: 'TrueNAS adapter unavailable' });
+        const snapshots = await ctx.adapter.listGoldenSnapshots(config.goldenZvol);
         label = nextVersionLabel(snapshots);
       }
       const versionLabel = String(label).startsWith('gold-') ? String(label) : `gold-${label}`;

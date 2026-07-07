@@ -12,7 +12,9 @@ const {
 
 function opErrorStatus(message) {
   const m = String(message || '').toLowerCase();
-  return (m.includes('session') || m.includes('force')) ? 409 : 500;
+  if (m.includes('already exists') || m.includes('collision')) return 409;
+  if (m.includes('session') || m.includes('force')) return 409;
+  return 500;
 }
 
 function createClientsRouter(ctx) {
@@ -40,7 +42,7 @@ function createClientsRouter(ctx) {
   router.post('/api/clients', async (req, res) => {
     try {
       const body = req.body || {};
-      const { name, sizeOverride } = body;
+      const { name } = body;
       if (typeof name !== 'string' || name.trim() === '') {
         return res.status(400).json({ error: 'name is required' });
       }
@@ -50,10 +52,10 @@ function createClientsRouter(ctx) {
       } catch (err) {
         return res.status(400).json({ error: err.message });
       }
-      const client = await createClient(ctx, { name, mac, sizeOverride });
+      const client = await createClient(ctx, { name, mac });
       return res.status(201).json(client);
     } catch (err) {
-      return res.status(500).json({ error: err.message });
+      return res.status(opErrorStatus(err.message)).json({ error: err.message });
     }
   });
 
@@ -109,6 +111,18 @@ function createClientsRouter(ctx) {
     }
   });
 
+  router.post('/api/clients/:id/nightly-reset', (req, res) => {
+    try {
+      const id = req.params.id;
+      if (!getClient(db, id)) return res.status(404).json({ error: 'Not found' });
+      const enabled = !!(req.body && req.body.enabled);
+      updateClient(db, id, { nightly_reset: enabled ? 1 : 0 });
+      return res.status(200).json({ ok: true });
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  });
+
   router.post('/api/discovered/:mac/adopt', async (req, res) => {
     try {
       const body = req.body || {};
@@ -122,10 +136,15 @@ function createClientsRouter(ctx) {
         return res.status(400).json({ error: err.message });
       }
       const client = await createClient(ctx, { name: body.name, mac });
-      removeDiscovered(db, mac);
+      // In DRY_RUN, createClient returns a fake row (id: null) without
+      // inserting anything — clearing the discovered record here would make
+      // the machine vanish from both lists until it boots again.
+      if (client && client.id != null) {
+        removeDiscovered(db, mac);
+      }
       return res.status(201).json(client);
     } catch (err) {
-      return res.status(500).json({ error: err.message });
+      return res.status(opErrorStatus(err.message)).json({ error: err.message });
     }
   });
 

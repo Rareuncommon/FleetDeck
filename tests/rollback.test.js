@@ -140,10 +140,10 @@ test('resetClient refuses to touch a snapshot path or the golden zvol', async ()
   const adapter = makeAdapter();
   const ctx = makeCtx(adapter);
 
-  const goldId = seedClient(ctx, { zvol: 'Main_pool/iscsi/golden', mac: '00:00:00:00:00:03' });
+  const goldId = seedClient(ctx, { zvol: 'Main_pool/iscsi/golden', target_name: 'golden', mac: '00:00:00:00:00:03' });
   await assert.rejects(() => resetClient(ctx, goldId), /golden zvol/);
 
-  const snapId = seedClient(ctx, { zvol: 'Main_pool/iscsi/client01@gold-v1', mac: '00:00:00:00:00:04' });
+  const snapId = seedClient(ctx, { zvol: 'Main_pool/iscsi/client01@gold-v1', target_name: 'client01-snap', mac: '00:00:00:00:00:04' });
   await assert.rejects(() => resetClient(ctx, snapId), /snapshot path/);
 
   assert.equal(adapter.calls.length, 0);

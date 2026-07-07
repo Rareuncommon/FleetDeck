@@ -16,12 +16,23 @@ function deriveTruenasHost(url) {
 
 function loadConfig(env = process.env) {
   const truenasUrl = env.TRUENAS_URL || 'wss://192.168.1.36:8444/websocket';
+
+  // Fail fast: an empty ADMIN_PASSWORD lets safeEqual('', '') succeed (login
+  // with no password), and an empty COOKIE_SECRET makes session cookies
+  // trivially forgeable (HMAC with a known/empty key). Never default these.
+  if (!env.ADMIN_PASSWORD) {
+    throw new Error('ADMIN_PASSWORD is required and must not be empty');
+  }
+  if (!env.COOKIE_SECRET) {
+    throw new Error('COOKIE_SECRET is required and must not be empty');
+  }
+
   return {
     truenasUrl,
     truenasApiKey: env.TRUENAS_API_KEY || '',
     truenasHost: deriveTruenasHost(truenasUrl),
-    adminPassword: env.ADMIN_PASSWORD || '',
-    cookieSecret: env.COOKIE_SECRET || '',
+    adminPassword: env.ADMIN_PASSWORD,
+    cookieSecret: env.COOKIE_SECRET,
     httpPort: Number(env.HTTP_PORT) || 8080,
     httpBind: env.HTTP_BIND || '0.0.0.0',
     dryRun: truthyFlag(env.DRY_RUN, true),

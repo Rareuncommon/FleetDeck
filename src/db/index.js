@@ -95,6 +95,14 @@ function listEvents(db, { limit = 100 } = {}) {
   return db.prepare('SELECT * FROM events ORDER BY id DESC LIMIT ?').all(limit);
 }
 
+// The events table has no other retention policy and /boot/* (unauthenticated,
+// on-LAN) can grow it indefinitely just from unknown-MAC boot attempts.
+function pruneEvents(db, keep = 5000) {
+  db.prepare(
+    'DELETE FROM events WHERE id NOT IN (SELECT id FROM events ORDER BY id DESC LIMIT ?)'
+  ).run(keep);
+}
+
 function upsertDiscovered(db, mac) {
   db.prepare(
     `INSERT INTO discovered (mac) VALUES (?)
@@ -114,6 +122,6 @@ function removeDiscovered(db, mac) {
 
 module.exports = {
   initDb, listClients, getClient, getClientByMac, insertClient, updateClient, deleteClient,
-  getSetting, setSetting, getAllSettings, logEvent, listEvents,
+  getSetting, setSetting, getAllSettings, logEvent, listEvents, pruneEvents,
   upsertDiscovered, listDiscovered, removeDiscovered,
 };

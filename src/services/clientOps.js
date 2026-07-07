@@ -1,7 +1,7 @@
 'use strict';
 
 const {
-  getClient, insertClient, updateClient, deleteClient,
+  getClient, getClientByMac, listClients, insertClient, updateClient, deleteClient,
   getSetting, setSetting, logEvent,
 } = require('../db');
 
@@ -38,13 +38,19 @@ function assertSafeToDestroy(ctx, client) {
   }
 }
 
+// Anchor the match on a ':' boundary (the IQN target separator) so a target
+// named "pc1" cannot be matched by a session for "pc10" or "mypc1" (plain
+// includes()/endsWith() against the bare name would false-positive on both).
+function targetMatches(sessionTarget, targetName) {
+  if (!sessionTarget || !targetName) return false;
+  const t = String(sessionTarget);
+  return t === targetName || t.endsWith(`:${targetName}`);
+}
+
 async function assertNoActiveSession(ctx, client, force) {
   if (force) return;
   const sessions = await ctx.adapter.listSessions();
-  const active = (sessions || []).some((s) => {
-    if (!s || !s.target || !client.target_name) return false;
-    return s.target === client.target_name || String(s.target).includes(client.target_name);
-  });
+  const active = (sessions || []).some((s) => targetMatches(s && s.target, client.target_name));
   if (active) {
     throw new Error(
       `Client "${client.name}" has an active iSCSI session; pass { force: true } to proceed.`
@@ -58,15 +64,33 @@ async function resolveSnapshotId(ctx, nameOrId) {
   return match ? match.id : nameOrId;
 }
 
+// Picks the highest gold-vN by parsed version number, not list order (TrueNAS's
+// query result order is not a version guarantee, and even if it were, lexical
+// order would put "gold-v10" before "gold-v2"). Falls back to the last entry
+// for snapshots that don't match the gold-vN naming convention.
+function highestVersioned(list) {
+  let best = null;
+  let bestVersion = -1;
+  for (const snap of list) {
+    const m = /^gold-v(\d+)$/.exec(snap.name || '');
+    const version = m ? parseInt(m[1], 10) : -1;
+    if (version > bestVersion) {
+      bestVersion = version;
+      best = snap;
+    }
+  }
+  return best || list[list.length - 1];
+}
+
 async function resolveDefaultGolden(ctx) {
   const settingName = getSetting(ctx.db, 'golden_snapshot', null);
-  const list = await ctx.adapter.listGoldenSnapshots(ctx.config.goldenZvol);
+  const list = (await ctx.adapter.listGoldenSnapshots(ctx.config.goldenZvol)) || [];
   if (settingName) {
-    const match = (list || []).find((s) => s.name === settingName || s.id === settingName);
+    const match = list.find((s) => s.name === settingName || s.id === settingName);
     if (match) return { id: match.id, name: match.name };
     return { id: settingName, name: settingName };
   }
-  const last = (list || [])[list.length - 1];
+  const last = list.length > 0 ? highestVersioned(list) : null;
   if (!last) throw new Error(`No golden snapshot available on ${ctx.config.goldenZvol}`);
   return { id: last.id, name: last.name };
 }
@@ -90,9 +114,20 @@ async function rollback(ctx, created) {
   }
 }
 
-async function createClient(ctx, { name, mac, sizeOverride }) {
+async function createClient(ctx, { name, mac }) {
   const leaf = slug(name);
   const zvol = `${ctx.config.clientZvolRoot}/${leaf}`;
+
+  // Check for collisions before touching TrueNAS at all: a mac UNIQUE
+  // violation (or a name-slug collision, e.g. "PC 1" and "PC-1" both -> "pc-1")
+  // must not be discovered only after cloning/creating real infrastructure
+  // that then has to be rolled back for no reason.
+  if (getClientByMac(ctx.db, mac)) {
+    throw new Error(`A client with mac "${mac}" already exists`);
+  }
+  if (listClients(ctx.db).some((c) => c.zvol === zvol || c.target_name === leaf)) {
+    throw new Error(`A client already resolves to zvol/target "${leaf}" (name collision)`);
+  }
 
   if (ctx.config.dryRun) {
     const goldenName = getSetting(ctx.db, 'golden_snapshot', null) || 'gold-vX';
@@ -101,7 +136,7 @@ async function createClient(ctx, { name, mac, sizeOverride }) {
       after: {
         name, mac, zvol, target_name: leaf, extent_name: leaf,
         disk: `zvol/${zvol}`, iqn: ctx.config.iqnPrefix,
-        golden_snapshot: goldenName, sizeOverride: sizeOverride ?? null,
+        golden_snapshot: goldenName,
       },
     });
     return { id: null, name, mac, zvol, target_name: leaf, golden_snapshot: goldenName, notes: null, dryRun: true };
@@ -180,12 +215,16 @@ async function retireClient(ctx, clientId) {
   const client = getClient(ctx.db, clientId);
   if (!client) throw new Error('Client not found');
 
+  // Guardrail must run before the dryRun short-circuit (matching reclone's
+  // order) so a dry-run faithfully surfaces a guardrail violation instead of
+  // reporting success on an operation that will fail once armed.
+  assertSafeToDestroy(ctx, client);
+
   if (ctx.config.dryRun) {
     logEvent(ctx.db, { action: 'client.retire.dryrun', clientId, before: client });
     return client;
   }
 
-  assertSafeToDestroy(ctx, client);
   const leaf = leafOf(client.zvol);
 
   const warn = (message) => logEvent(ctx.db, {
@@ -214,7 +253,9 @@ async function retireClient(ctx, clientId) {
 
 async function promoteGolden(ctx, { versionLabel } = {}) {
   if (!versionLabel) throw new Error('promoteGolden requires versionLabel');
-  const name = `gold-${versionLabel}`;
+  // Caller (route) is responsible for the final "gold-" prefixed name — this
+  // function must not add its own prefix or names come out double-prefixed.
+  const name = versionLabel;
 
   if (ctx.config.dryRun) {
     logEvent(ctx.db, {

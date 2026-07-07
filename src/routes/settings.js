@@ -29,6 +29,13 @@ function createSettingsRouter(ctx) {
         setSetting(db, key, String(body[key]));
       }
       logEvent(db, { action: 'settings.update', after: body });
+      // node-cron reads its expression once at schedule() time, so without
+      // this an edited nightly_reset_cron would silently do nothing until
+      // the process restarts. Read ctx.rescheduleCron live (not destructured
+      // at router construction) since it's attached after startScheduler runs.
+      if (Object.prototype.hasOwnProperty.call(body, 'nightly_reset_cron') && ctx.rescheduleCron) {
+        ctx.rescheduleCron();
+      }
       return res.status(200).json(getAllSettings(db));
     } catch (err) {
       return res.status(500).json({ error: err.message });

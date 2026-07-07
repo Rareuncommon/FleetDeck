@@ -92,13 +92,13 @@
         <form id="new-client" class="row" autocomplete="off">
           <input name="name" placeholder="name" required>
           <input name="mac" placeholder="aa:bb:cc:dd:ee:ff" class="mono" required>
-          <input name="sizeOverride" placeholder="size override (opt)" style="width:150px">
           <button class="accent" type="submit">Create</button>
           <span id="nc-msg" class="msg"></span>
         </form>
       </div>
       <div class="row" style="margin-bottom:6px">
         <button id="bulk-reset" disabled>Reset selected</button>
+        <button id="bulk-force-stuck" class="danger" style="display:none">Force reset stuck</button>
         <span id="bulk-msg" class="msg"></span>
       </div>
       <table id="clients">
@@ -195,6 +195,7 @@ function fmtTime(t) {
 // ---- Dashboard ----
 let clients = [];
 let goldenNames = [];
+let bulkStuckIds = [];
 
 function renderClients(list) {
   clients = list;
@@ -219,6 +220,7 @@ function renderClients(list) {
         <button data-act="reset" data-id="${c.id}">Reset</button>
         <select data-act="rebase-pick" data-id="${c.id}" style="width:110px"><option value="">Rebase…</option>${picker}</select>
         <button data-act="golden-once" data-id="${c.id}">${c.boot_golden_once ? "Unset⚑" : "Golden⚑"}</button>
+        <button data-act="nightly" data-id="${c.id}" data-on="${c.nightly_reset ? "1" : "0"}">${c.nightly_reset ? "Nightly✓" : "Nightly?"}</button>
         <button class="danger" data-act="retire" data-id="${c.id}" data-name="${esc(c.name)}">Retire</button>
       </td>`;
     body.appendChild(tr);
@@ -270,6 +272,9 @@ $("#dashboard").addEventListener("click", async e => {
       loadClients();
     } else if (act === "golden-once") {
       await api("POST", `/api/clients/${id}/boot-golden-once`); loadClients();
+    } else if (act === "nightly") {
+      const enabled = b.dataset.on !== "1";
+      await api("POST", `/api/clients/${id}/nightly-reset`, { enabled }); loadClients();
     } else if (act === "retire") {
       const name = b.dataset.name;
       if (prompt(`Type "${name}" to retire this client:`) === name) { await api("DELETE", `/api/clients/${id}`); loadClients(); }
@@ -302,21 +307,44 @@ $("#sel-all").addEventListener("change", e => {
   updateBulkBtn();
 });
 
+// Bulk reset does NOT force by default — a machine with an active iSCSI
+// session is presumably in use, and one click destroying its disk without
+// any signal is exactly the kind of accident the backend guardrail exists
+// to prevent. Session-blocked ids are surfaced for an explicit forced retry.
 $("#bulk-reset").addEventListener("click", async () => {
   const ids = [...document.querySelectorAll("#clients-body .sel:checked")].map(c => c.value);
+  let ok = 0, fail = 0; const stuck = [];
+  for (const id of ids) {
+    try { await api("POST", `/api/clients/${id}/reset`, {}); ok++; }
+    catch (e) { if (/session/i.test(e.message)) stuck.push(id); else fail++; }
+  }
+  bulkStuckIds = stuck;
+  let msg = `Reset ${ok} ok, ${fail} failed`;
+  if (stuck.length) msg += `, ${stuck.length} skipped (active session)`;
+  $("#bulk-msg").textContent = msg;
+  $("#bulk-msg").className = "msg " + (fail || stuck.length ? "err" : "ok");
+  $("#bulk-force-stuck").style.display = stuck.length ? "" : "none";
+  $("#bulk-force-stuck").textContent = `Force reset stuck (${stuck.length})`;
+  loadClients();
+});
+
+$("#bulk-force-stuck").addEventListener("click", async () => {
+  const ids = bulkStuckIds;
+  if (!ids.length || !confirm(`Force reset ${ids.length} client(s) with an active session? Their disks will be destroyed while in use.`)) return;
   let ok = 0, fail = 0;
   for (const id of ids) {
     try { await api("POST", `/api/clients/${id}/reset`, { force: true }); ok++; } catch (e) { fail++; }
   }
-  $("#bulk-msg").textContent = `Reset ${ok} ok, ${fail} failed`;
+  bulkStuckIds = [];
+  $("#bulk-msg").textContent = `Force reset ${ok} ok, ${fail} failed`;
   $("#bulk-msg").className = "msg " + (fail ? "err" : "ok");
+  $("#bulk-force-stuck").style.display = "none";
   loadClients();
 });
 
 $("#new-client").addEventListener("submit", async e => {
   e.preventDefault();
   const f = e.target, body = { name: f.name.value.trim(), mac: f.mac.value.trim() };
-  if (f.sizeOverride.value.trim()) body.sizeOverride = f.sizeOverride.value.trim();
   const msg = $("#nc-msg");
   try {
     await api("POST", "/api/clients", body);
@@ -350,9 +378,20 @@ $("#golden-body").addEventListener("click", async e => {
   if (!ids.length) { setMsg("#golden-msg", "All clients already on " + snap, true); return; }
   if (!confirm(`Rebase ${ids.length} client(s) onto ${snap}?`)) return;
   try {
-    const r = await api("POST", "/api/golden/bulk-rebase", { clientIds: ids, goldenSnapshot: snap, force: true });
-    const fail = (r.results || []).filter(x => !x.ok).length;
-    setMsg("#golden-msg", `Rebased ${(r.results || []).length - fail} ok, ${fail} failed`, !fail);
+    // Don't force by default — a session-active machine is presumably in
+    // use; only force it after this first pass reports it as stuck.
+    const r = await api("POST", "/api/golden/bulk-rebase", { clientIds: ids, goldenSnapshot: snap, force: false });
+    const results = r.results || [];
+    const stuck = results.filter(x => !x.ok && /session/i.test(x.error || "")).map(x => x.id);
+    const fail = results.filter(x => !x.ok && !stuck.includes(x.id)).length;
+    let msg = `Rebased ${results.length - fail - stuck.length} ok, ${fail} failed`;
+    if (stuck.length) msg += `, ${stuck.length} skipped (active session)`;
+    setMsg("#golden-msg", msg, !fail && !stuck.length);
+    if (stuck.length && confirm(`${stuck.length} client(s) have an active session. Force rebase them too?`)) {
+      const r2 = await api("POST", "/api/golden/bulk-rebase", { clientIds: stuck, goldenSnapshot: snap, force: true });
+      const fail2 = (r2.results || []).filter(x => !x.ok).length;
+      setMsg("#golden-msg", `Force rebased ${(r2.results || []).length - fail2} ok, ${fail2} failed`, !fail2);
+    }
     loadClients();
   } catch (err) { setMsg("#golden-msg", err.message, false); }
 });

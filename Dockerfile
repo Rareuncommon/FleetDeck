@@ -31,7 +31,6 @@ COPY package.json package-lock.json ./
 
 # Application source.
 COPY src ./src
-COPY config ./config
 
 # SQLite data lives here; mount a host-path volume over it to persist state.
 RUN mkdir -p /data && chown -R fleetdeck:fleetdeck /app /data
