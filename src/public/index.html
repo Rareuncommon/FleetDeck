@@ -68,6 +68,14 @@
   .muted { color: var(--dimmer); }
   .toggle-on { color: var(--accent); font-weight: 600; }
   .tag { font-size: 11px; padding: 1px 5px; border: 1px solid var(--border); border-radius: 3px; color: var(--dim); }
+  .tiles { display: flex; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; }
+  .tile { background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 8px 14px; min-width: 100px; }
+  .tile .n { font-size: 20px; font-weight: 700; }
+  .tile .l { font-size: 11px; text-transform: uppercase; letter-spacing: .5px; color: var(--dimmer); }
+  .tile.warn { border-color: var(--amber); }
+  .tile.warn .n { color: var(--amber); }
+  .tile.crit { border-color: var(--red); }
+  .tile.crit .n { color: var(--red); }
 </style>
 </head>
 <body>
@@ -78,6 +86,7 @@
     <nav>
       <button data-view="dashboard" class="active">Dashboard</button>
       <button data-view="golden">Golden</button>
+      <button data-view="reconcile">Reconcile</button>
       <button data-view="settings">Settings</button>
       <button data-view="events">Audit</button>
     </nav>
@@ -87,6 +96,7 @@
   </header>
   <main>
     <section id="dashboard" class="active">
+      <div class="tiles" id="stat-tiles"></div>
       <div class="panel">
         <h2 style="margin-top:0">New client</h2>
         <form id="new-client" class="row" autocomplete="off">
@@ -95,6 +105,15 @@
           <button class="accent" type="submit">Create</button>
           <span id="nc-msg" class="msg"></span>
         </form>
+      </div>
+      <div class="panel">
+        <h2 style="margin-top:0">Bulk import (CSV)</h2>
+        <div class="row">
+          <input type="file" id="bulk-import-file" accept=".csv,text/csv">
+          <button id="bulk-import-btn" class="accent">Import</button>
+          <span id="bulk-import-msg" class="msg"></span>
+        </div>
+        <div id="bulk-import-results"></div>
       </div>
       <div class="row" style="margin-bottom:6px">
         <button id="bulk-reset" disabled>Reset selected</button>
@@ -127,12 +146,36 @@
       </table>
     </section>
 
+    <section id="reconcile">
+      <div class="row" style="margin-bottom:10px">
+        <button id="reconcile-scan" class="accent">Scan for mismatches</button>
+        <span id="reconcile-msg" class="msg"></span>
+      </div>
+      <h2 style="margin-top:0">Unregistered TrueNAS targets</h2>
+      <table>
+        <thead><tr><th>Target</th><th>Zvol</th><th></th></tr></thead>
+        <tbody id="reconcile-truenas-body"></tbody>
+      </table>
+      <h2>FleetDeck clients with no matching TrueNAS target</h2>
+      <table>
+        <thead><tr><th>Name</th><th>MAC</th><th>Target</th><th></th></tr></thead>
+        <tbody id="reconcile-db-body"></tbody>
+      </table>
+    </section>
+
     <section id="settings">
       <div class="panel">
         <div id="settings-grid" class="grid"></div>
         <div class="row" style="margin-top:12px">
           <button id="save-settings" class="accent">Save</button>
           <span id="settings-msg" class="msg"></span>
+        </div>
+      </div>
+      <div class="panel">
+        <h2 style="margin-top:0">TrueNAS connection</h2>
+        <div class="row">
+          <button id="test-connection">Test connection</button>
+          <span id="tc-msg" class="msg"></span>
         </div>
       </div>
     </section>
@@ -240,6 +283,36 @@ async function loadClients() {
     renderClients(list);
     $("#poll-stamp").textContent = "updated " + new Date().toLocaleTimeString();
   } catch (e) {}
+  const poolStatus = await loadPoolStatus();
+  renderStatTiles(poolStatus);
+}
+
+async function loadPoolStatus() {
+  try {
+    const r = await api("GET", "/api/pool/status");
+    return r && r.status;
+  } catch (e) { return null; }
+}
+
+function renderStatTiles(poolStatus) {
+  const total = clients.length;
+  const booted = clients.filter(c => c.status === "booted").length;
+  const offline = clients.filter(c => c.status === "offline").length;
+  const tiles = [
+    { l: "Clients", n: total },
+    { l: "Booted", n: booted },
+    { l: "Offline", n: offline },
+  ];
+  if (poolStatus && poolStatus.usedPercent != null) {
+    const pct = poolStatus.usedPercent;
+    const cls = pct >= 95 ? "crit" : pct >= 85 ? "warn" : "";
+    tiles.push({ l: "Pool used", n: pct.toFixed(1) + "%", cls });
+  } else {
+    tiles.push({ l: "Pool used", n: "—" });
+  }
+  $("#stat-tiles").innerHTML = tiles.map(t =>
+    `<div class="tile ${t.cls || ""}"><div class="n">${esc(t.n)}</div><div class="l">${esc(t.l)}</div></div>`
+  ).join("");
 }
 
 async function loadDiscovered() {
@@ -352,12 +425,32 @@ $("#new-client").addEventListener("submit", async e => {
   } catch (err) { msg.textContent = err.message; msg.className = "msg err"; }
 });
 
+$("#bulk-import-btn").addEventListener("click", async () => {
+  const fileInput = $("#bulk-import-file");
+  const msg = $("#bulk-import-msg");
+  const resultsEl = $("#bulk-import-results");
+  if (!fileInput.files[0]) { msg.textContent = "Choose a CSV file first"; msg.className = "msg err"; return; }
+  const text = await fileInput.files[0].text();
+  try {
+    const r = await api("POST", "/api/clients/bulk-import", { csv: text });
+    const results = r.results || [];
+    const ok = results.filter(x => x.ok).length;
+    const fail = results.length - ok;
+    msg.textContent = `Imported ${ok} ok, ${fail} failed`;
+    msg.className = "msg " + (fail ? "err" : "ok");
+    resultsEl.innerHTML = "<pre>" + esc(results.map(x =>
+      `row ${x.row}: ${x.name} (${x.mac}) — ${x.ok ? "ok" : x.error}`
+    ).join("\n")) + "</pre>";
+    fileInput.value = "";
+    loadClients();
+  } catch (err) { msg.textContent = err.message; msg.className = "msg err"; }
+});
+
 // ---- Golden ----
 async function loadGolden() {
   let snaps = [];
   try { snaps = await api("GET", "/api/golden/snapshots"); } catch (e) { return; }
   goldenNames = snaps.map(s => s.name);
-  const latest = goldenNames.length ? goldenNames[goldenNames.length - 1] : null;
   const body = $("#golden-body");
   body.innerHTML = "";
   for (const s of snaps) {
@@ -405,14 +498,80 @@ $("#promote").addEventListener("click", async () => {
   } catch (err) { setMsg("#golden-msg", err.message, false); }
 });
 
+// ---- Reconcile ----
+async function loadReconcile() {
+  $("#reconcile-msg").textContent = "";
+  let data = { trueNasOnly: [], dbOnly: [] };
+  try { data = await api("GET", "/api/reconcile/scan"); }
+  catch (err) { setMsg("#reconcile-msg", err.message, false); }
+
+  const tBody = $("#reconcile-truenas-body");
+  tBody.innerHTML = data.trueNasOnly.length ? "" : '<tr><td colspan="3" class="muted">None</td></tr>';
+  for (const t of data.trueNasOnly) {
+    const tr = el("tr");
+    tr.innerHTML = `<td class="mono">${esc(t.targetName)}</td><td class="mono muted">${esc(t.zvol || "—")}</td>
+      <td><button class="accent" data-act="import" data-target="${esc(t.targetName)}">Import as client…</button></td>`;
+    tBody.appendChild(tr);
+  }
+
+  const dBody = $("#reconcile-db-body");
+  dBody.innerHTML = data.dbOnly.length ? "" : '<tr><td colspan="4" class="muted">None</td></tr>';
+  for (const c of data.dbOnly) {
+    const tr = el("tr");
+    tr.innerHTML = `<td>${esc(c.name)}</td><td class="mono">${esc(c.mac)}</td><td class="mono muted">${esc(c.target_name)}</td>
+      <td><button class="danger" data-act="remove-orphan" data-id="${c.id}" data-name="${esc(c.name)}">Remove stale row</button></td>`;
+    dBody.appendChild(tr);
+  }
+}
+
+$("#reconcile-scan").addEventListener("click", loadReconcile);
+
+$("#reconcile").addEventListener("click", async e => {
+  const b = e.target.closest("button"); if (!b) return;
+  if (b.dataset.act === "import") {
+    const targetName = b.dataset.target;
+    const name = prompt(`Name for imported client (TrueNAS target "${targetName}"):`);
+    if (!name) return;
+    const mac = prompt("MAC address for this machine:");
+    if (!mac) return;
+    try {
+      await api("POST", "/api/reconcile/import", { name, mac, targetName });
+      loadReconcile(); loadClients();
+    } catch (err) { alert(err.message); }
+  } else if (b.dataset.act === "remove-orphan") {
+    const name = b.dataset.name;
+    if (prompt(`Type "${name}" to remove this stale row (this does not touch TrueNAS):`) === name) {
+      try {
+        await api("POST", "/api/reconcile/remove-orphan-client", { clientId: b.dataset.id });
+        loadReconcile();
+      } catch (err) { alert(err.message); }
+    }
+  }
+});
+
 // ---- Settings ----
+// Seed defaults for keys the backend reads via getSetting(db,key,default) so
+// they're visible/editable even before anything has ever written a row for
+// them (otherwise these tunables would be invisible until set once by hand).
+const SETTINGS_DEFAULTS = {
+  iqn_prefix: "iqn.2005-10.org.freenas.ctl",
+  ipxe_template: "",
+  golden_snapshot: "",
+  nightly_reset_cron: "0 4 * * *",
+  wol_enabled: "0",
+  pool_alert_threshold_pct: "85",
+  safety_snapshot_retention_days: "3",
+};
 async function loadSettings() {
   let s = {};
   try { s = await api("GET", "/api/settings"); } catch (e) { return; }
+  const merged = { ...SETTINGS_DEFAULTS, ...s };
   const g = $("#settings-grid"); g.innerHTML = "";
-  for (const k of Object.keys(s)) {
+  for (const k of Object.keys(merged)) {
     g.appendChild(el("label", { textContent: k }));
-    g.appendChild(el("input", { className: "mono", dataset: { key: k }, value: s[k] == null ? "" : s[k] }));
+    const inp = el("input", { className: "mono", value: merged[k] == null ? "" : merged[k] });
+    inp.dataset.key = k;
+    g.appendChild(inp);
   }
 }
 $("#save-settings").addEventListener("click", async () => {
@@ -420,6 +579,16 @@ $("#save-settings").addEventListener("click", async () => {
   document.querySelectorAll("#settings-grid input").forEach(i => patch[i.dataset.key] = i.value);
   try { await api("PUT", "/api/settings", patch); setMsg("#settings-msg", "Saved", true); }
   catch (err) { setMsg("#settings-msg", err.message, false); }
+});
+
+$("#test-connection").addEventListener("click", async () => {
+  const msg = $("#tc-msg");
+  msg.textContent = "Testing…"; msg.className = "msg";
+  try {
+    const r = await api("POST", "/api/truenas/test-connection");
+    if (r.ok) { msg.textContent = `Connected (${r.methodsResolved} methods resolved)`; msg.className = "msg ok"; }
+    else { msg.textContent = "Failed: " + r.error; msg.className = "msg err"; }
+  } catch (err) { msg.textContent = err.message; msg.className = "msg err"; }
 });
 
 // ---- Events ----
@@ -451,6 +620,7 @@ document.querySelectorAll("nav button").forEach(b => b.addEventListener("click",
   b.classList.add("active");
   const v = b.dataset.view; $("#" + v).classList.add("active");
   if (v === "golden") loadGolden();
+  else if (v === "reconcile") loadReconcile();
   else if (v === "settings") loadSettings();
   else if (v === "events") loadEvents();
 }));

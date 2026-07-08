@@ -1,5 +1,8 @@
 const cron = require('node-cron');
-const { listClients, getSetting, logEvent, pruneEvents } = require('../db');
+const {
+  listClients, getSetting, logEvent, pruneEvents,
+  listExpiredSafetySnapshots, deleteSafetySnapshotRecord,
+} = require('../db');
 const { resetClient } = require('./clientOps');
 
 const DEFAULT_CRON = '0 4 * * *';
@@ -32,6 +35,25 @@ async function runNightlyReset(ctx) {
   // The events table has no other retention policy; ride along on the same
   // nightly fire rather than adding a second timer for this.
   pruneEvents(ctx.db);
+
+  // Purge expired quarantine safety-snapshots (the undo window has closed).
+  // Skip in dry-run / adapter-less mode: nothing real exists to delete.
+  if (!ctx.config.dryRun && ctx.adapter) {
+    const retentionDays = parseInt(getSetting(ctx.db, 'safety_snapshot_retention_days', '3'), 10) || 3;
+    const expired = listExpiredSafetySnapshots(ctx.db, retentionDays);
+    for (const row of expired) {
+      try {
+        await ctx.adapter.deleteDataset(row.zvol, { recursive: true, force: true });
+        // Only drop the tracking row once the dataset is actually gone. If the
+        // delete failed, keep the row so the next nightly run retries it —
+        // discarding it here would orphan the quarantine dataset forever with
+        // no record to find it by (the adapter has no prefix enumeration).
+        deleteSafetySnapshotRecord(ctx.db, row.id);
+      } catch (err) {
+        console.error(`[scheduler] failed to purge expired safety snapshot ${row.zvol}:`, err);
+      }
+    }
+  }
 }
 
 function resolveCronExpr(ctx) {

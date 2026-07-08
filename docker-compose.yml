@@ -14,7 +14,7 @@ services:
     # Secrets stay out of this file. Copy .env.example to .env and fill it in.
     # Vars consumed (see .env.example): TRUENAS_URL, TRUENAS_API_KEY,
     # ADMIN_PASSWORD, COOKIE_SECRET, HTTP_PORT, HTTP_BIND, DRY_RUN, DB_PATH,
-    # IQN_PREFIX, GOLDEN_ZVOL, CLIENT_ZVOL_ROOT.
+    # IQN_PREFIX, GOLDEN_ZVOL, CLIENT_ZVOL_ROOT, POOL_NAME.
     env_file: .env
 
     # Persist the SQLite state file across container restarts/upgrades.

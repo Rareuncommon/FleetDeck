@@ -9,10 +9,16 @@ FleetDeck is a single-container web app that manages a diskless Windows gaming f
 - **Bulk reset + nightly cron** — reset the whole fleet at once, or on a schedule (`node-cron`) for a clean image every morning.
 - **iPXE script serving** — serves per-client boot scripts at `/boot/<mac-hexhyp>.ipxe`, with an unknown-MAC discovery/adopt flow so new machines show up in the dashboard ready to be provisioned.
 - **DRY_RUN safety** — introspect TrueNAS read-only before letting FleetDeck mutate anything.
+- **Auto safety-snapshot** — every reset/rebase/retire quarantine-clones the client's pre-wipe zvol before touching it, giving a brief undo window (purged automatically after a retention period).
+- **Wake-on-LAN** — optionally sends a magic packet after a successful reset/rebase, so a nightly wipe leaves the machine booted and ready by morning (opt-in; requires WoL enabled on each client's NIC/firmware).
+- **Pool capacity alerting** — polls the TrueNAS pool's used/available space and logs a warning once usage crosses a configurable threshold.
+- **Reconciliation** — scan for TrueNAS iSCSI targets FleetDeck doesn't know about (import them as clients) and FleetDeck clients whose TrueNAS target has vanished (remove the stale row).
+- **Bulk CSV import** — onboard many machines at once instead of one at a time.
+- **On-demand connection test** — check TrueNAS connectivity from Settings without restarting the app.
 
 ## Data model
 
-SQLite (`better-sqlite3`), four tables:
+SQLite (`better-sqlite3`), five tables:
 
 | Table | Holds |
 |-------|-------|
@@ -20,6 +26,7 @@ SQLite (`better-sqlite3`), four tables:
 | `settings` | Key/value app config (e.g. current golden version, cron schedule). |
 | `events` | Append-only audit log of every action and TrueNAS mutation. |
 | `discovered` | Unknown MACs seen at `/boot/*`, awaiting adopt. |
+| `safety_snapshots` | Quarantine clones made before destructive ops, purged after a retention window. |
 
 ## Running it
 
@@ -59,6 +66,19 @@ Set as env vars in the TrueNAS Custom App, or via `.env` for local/compose. See 
 | `IQN_PREFIX` | Base IQN for iSCSI targets. | `iqn.2005-10.org.freenas.ctl` |
 | `GOLDEN_ZVOL` | Zvol path for the golden (sysprepped) image; snapshots `@gold-vN`. | `Main_pool/iscsi/win-golden` |
 | `CLIENT_ZVOL_ROOT` | Root dataset path where per-client clone zvols live. | `Main_pool/iscsi` |
+| `POOL_NAME` | Pool name for capacity alerting. Defaults to `CLIENT_ZVOL_ROOT`'s first path segment. | `Main_pool` |
+
+A few more tunables live in the in-app Settings panel rather than as env vars (`wol_enabled`, `pool_alert_threshold_pct`, `safety_snapshot_retention_days`, `nightly_reset_cron`) since they're safe to change at runtime without a restart.
+
+### Safety-snapshot prerequisite
+
+The auto safety-snapshot feature clones each pre-wipe zvol into `<CLIENT_ZVOL_ROOT>/_safety/...` before destroying it. ZFS clone does not create intermediate datasets, so the `_safety` dataset must exist under your client zvol root *before* the first reset/rebase/retire, e.g.:
+
+```
+zfs create Main_pool/iscsi/_safety
+```
+
+If it's missing, quarantining silently fails closed (logged as `client.safety_snapshot.failed` in the audit log) and the wipe proceeds with no undo window — not blocked, just unprotected. Create it once during initial setup.
 
 ### The DRY_RUN safety flag
 

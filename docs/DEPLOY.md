@@ -34,11 +34,24 @@ Set these in the app's environment config:
 | `IQN_PREFIX` | `iqn.2005-10.org.freenas.ctl`. |
 | `GOLDEN_ZVOL` | e.g. `Main_pool/iscsi/win-golden`. |
 | `CLIENT_ZVOL_ROOT` | e.g. `Main_pool/iscsi`. |
+| `POOL_NAME` | Pool name for capacity alerting, e.g. `Main_pool`. Defaults to `CLIENT_ZVOL_ROOT`'s first segment. |
+
+A few more tunables (`wol_enabled`, `pool_alert_threshold_pct`, `safety_snapshot_retention_days`, `nightly_reset_cron`) live in the in-app Settings panel, not as env vars — they take effect immediately without a restart.
 
 **Volume / storage**
 
 - Add a **host-path volume** mounting a persistent dataset to `/data` in the container.
 - This is where the SQLite file (`DB_PATH`) lives. Without it, all client/event state is lost on every app restart or upgrade.
+
+**One-time dataset for the safety-snapshot feature**
+
+Every reset/rebase/retire quarantine-clones the client's pre-wipe zvol into `<CLIENT_ZVOL_ROOT>/_safety/...` before destroying it, as a brief undo window. ZFS clone does not create intermediate datasets, so create the parent once before first use:
+
+```
+zfs create Main_pool/iscsi/_safety
+```
+
+If this dataset doesn't exist, the safety-snapshot step fails closed (logged as `client.safety_snapshot.failed`) and the wipe proceeds anyway — you lose the undo window silently rather than being blocked. Create it during initial setup so it's protected from the start.
 
 ---
 
@@ -49,8 +62,10 @@ Bring FleetDeck up in read-only mode before it's allowed to touch anything.
 1. Start the app with **`DRY_RUN=1`**.
 2. Open the dashboard and log in with `ADMIN_PASSWORD`.
 3. Confirm FleetDeck's introspection worked: it should show your real `win-golden` snapshots (`@gold-vN`) and any existing iSCSI targets, read-only. Nothing should be created or changed.
-4. Watch the events log — with `DRY_RUN=1`, actions you trigger appear as logged-but-skipped mutations. This is your proof that the TrueNAS connection and permissions are correct.
-5. Once introspection looks right, set **`DRY_RUN=0`** and restart the app to arm real mutations.
+4. Check **Settings > Test connection** as a quick, on-demand way to re-verify connectivity at any point without restarting the app.
+5. Try the **Reconcile** tab: it lists any existing TrueNAS iSCSI targets FleetDeck doesn't know about yet (useful if you have machines provisioned by hand before adopting FleetDeck) and any FleetDeck client rows whose TrueNAS target has disappeared. Both actions here (import, remove stale row) are non-destructive to TrueNAS — safe to explore even before arming `DRY_RUN=0`.
+6. Watch the events log — with `DRY_RUN=1`, actions you trigger appear as logged-but-skipped mutations. This is your proof that the TrueNAS connection and permissions are correct.
+7. Once introspection looks right, set **`DRY_RUN=0`** and restart the app to arm real mutations.
 
 Do not set `DRY_RUN=0` until step 3 is confirmed. A bad `TRUENAS_URL`, key, or zvol path is harmless in dry-run and destructive once armed.
 

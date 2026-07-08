@@ -2,8 +2,9 @@
 
 const {
   getClient, getClientByMac, listClients, insertClient, updateClient, deleteClient,
-  getSetting, setSetting, logEvent,
+  getSetting, setSetting, logEvent, insertSafetySnapshot,
 } = require('../db');
+const { sendWakeOnLan } = require('./wol');
 
 function slug(name) {
   return String(name).toLowerCase().replace(/[^a-z0-9-]/g, '-');
@@ -61,7 +62,19 @@ async function assertNoActiveSession(ctx, client, force) {
 async function resolveSnapshotId(ctx, nameOrId) {
   const list = await ctx.adapter.listGoldenSnapshots(ctx.config.goldenZvol);
   const match = (list || []).find((s) => s.id === nameOrId || s.name === nameOrId);
-  return match ? match.id : nameOrId;
+  if (!match) {
+    // Must throw, not silently pass `nameOrId` through as if it were a real
+    // snapshot id: this runs BEFORE the client's zvol is destroyed, so failing
+    // loudly here means reclone() aborts with nothing touched. Falling back to
+    // an unresolvable placeholder (e.g. a reconcile-imported client's
+    // golden_snapshot of 'unknown') would instead destroy the zvol and only
+    // THEN discover cloneSnapshot has nothing valid to reprovision from,
+    // leaving the client with no zvol at all.
+    throw new Error(
+      `No golden snapshot matches "${nameOrId}" on ${ctx.config.goldenZvol}; refusing to proceed`
+    );
+  }
+  return match.id;
 }
 
 // Picks the highest gold-vN by parsed version number, not list order (TrueNAS's
@@ -172,6 +185,33 @@ async function createClient(ctx, { name, mac }) {
   }
 }
 
+// Quarantine-clone before a destroy so there's a brief undo window. Snapshotting
+// the zvol in place is useless here: the subsequent recursive deleteDataset would
+// take the safety snapshot with it. Instead we snapshot then immediately clone
+// that snapshot into an independent dataset under _safety/ that survives the
+// client zvol's destruction, and record it in the DB for later cleanup (there is
+// no prefix-enumeration on the adapter, so our own row is the only tracker).
+// Best-effort: a failed safety net must never block the wipe the user asked for.
+async function quarantineBeforeDestroy(ctx, client, clientId, reason) {
+  if (ctx.config.dryRun) return;
+  try {
+    const snapId = await ctx.adapter.createSnapshot(client.zvol, `safety-${Date.now()}`);
+    if (!snapId) throw new Error('createSnapshot returned no snapshot id');
+    const quarantineZvol = `${ctx.config.clientZvolRoot}/_safety/${leafOf(client.zvol)}-${Date.now()}`;
+    await ctx.adapter.cloneSnapshot(snapId, quarantineZvol);
+    // Must promote before the caller destroys client.zvol: an unpromoted clone
+    // is still dependent on client.zvol's snapshot and would either block or be
+    // cascade-destroyed by the recursive delete that follows, defeating the
+    // entire point of this quarantine step. See adapter.js's promoteDataset.
+    await ctx.adapter.promoteDataset(quarantineZvol);
+    insertSafetySnapshot(ctx.db, { clientId, zvol: quarantineZvol, reason });
+  } catch (err) {
+    logEvent(ctx.db, {
+      action: 'client.safety_snapshot.failed', clientId, after: { error: err.message },
+    });
+  }
+}
+
 // Shared reset/rebase body. `rebaseTo` (when set) is the new golden snapshot to
 // clone from and record; otherwise the client's currently assigned one is reused.
 async function reclone(ctx, clientId, { force, rebaseTo }) {
@@ -193,12 +233,22 @@ async function reclone(ctx, clientId, { force, rebaseTo }) {
   await assertNoActiveSession(ctx, before, force);
   const snapshotId = await resolveSnapshotId(ctx, isRebase ? rebaseTo : before.golden_snapshot);
 
+  await quarantineBeforeDestroy(ctx, before, clientId, isRebase ? 'rebase' : 'reset');
+
   await ctx.adapter.deleteDataset(before.zvol, { recursive: true });
   await ctx.adapter.cloneSnapshot(snapshotId, before.zvol);
 
   updateClient(ctx.db, clientId, isRebase ? { golden_snapshot: rebaseTo } : {});
   const after = getClient(ctx.db, clientId);
   logEvent(ctx.db, { action, clientId, before, after });
+
+  const wolEnabled = getSetting(ctx.db, 'wol_enabled', '0') === '1';
+  if (wolEnabled && after.mac) {
+    sendWakeOnLan(after.mac).catch((err) => {
+      logEvent(ctx.db, { action: 'client.wol.failed', clientId, after: { error: err.message } });
+    });
+    logEvent(ctx.db, { action: 'client.wol.sent', clientId, after: { mac: after.mac } });
+  }
   return after;
 }
 
@@ -244,6 +294,8 @@ async function retireClient(ctx, clientId) {
   const extentId = firstId(await ctx.adapter.queryExtents([['name', '=', leaf]]));
   if (extentId != null) await ctx.adapter.deleteExtent(extentId);
   else warn(`extent "${leaf}" not found; skipping`);
+
+  await quarantineBeforeDestroy(ctx, client, clientId, 'retire');
 
   await ctx.adapter.deleteDataset(client.zvol, { recursive: true, force: true });
   deleteClient(ctx.db, clientId);

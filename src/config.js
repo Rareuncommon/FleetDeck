@@ -40,6 +40,9 @@ function loadConfig(env = process.env) {
     iqnPrefix: env.IQN_PREFIX || 'iqn.2005-10.org.freenas.ctl',
     goldenZvol: env.GOLDEN_ZVOL || 'Main_pool/iscsi/win-golden',
     clientZvolRoot: env.CLIENT_ZVOL_ROOT || 'Main_pool/iscsi',
+    // Root pool dataset (e.g. "Main_pool") for pool-capacity alerting — defaults
+    // to CLIENT_ZVOL_ROOT's first path segment, override if it ever differs.
+    poolName: env.POOL_NAME || (env.CLIENT_ZVOL_ROOT || 'Main_pool/iscsi').split('/')[0],
   };
 }
 

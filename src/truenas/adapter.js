@@ -8,6 +8,7 @@ const CANDIDATES = {
   snapshotClone:      ['zfs.snapshot.clone', 'pool.snapshot.clone'],
   datasetQuery:       ['pool.dataset.query'],
   datasetDelete:      ['pool.dataset.delete'],
+  datasetPromote:     ['pool.dataset.promote', 'zfs.dataset.promote'],
   extentQuery:        ['iscsi.extent.query'],
   extentCreate:       ['iscsi.extent.create'],
   extentDelete:       ['iscsi.extent.delete'],
@@ -88,6 +89,17 @@ class TrueNASAdapter {
   async deleteDataset(name, { recursive = false, force = false } = {}) {
     this._requireIntrospected();
     return this.client.call(this.methods.datasetDelete, [name, { recursive, force }]);
+  }
+
+  // A ZFS clone stays dependent on its origin snapshot until promoted — without
+  // this, destroying the origin's parent dataset either fails ("snapshot has
+  // dependent clones") or cascade-destroys the clone too, depending on how the
+  // recursive delete is implemented. Callers that clone-to-preserve data before
+  // a destructive operation (see clientOps.js's quarantineBeforeDestroy) must
+  // promote the clone immediately afterward so it becomes fully independent.
+  async promoteDataset(name) {
+    this._requireIntrospected();
+    return this.client.call(this.methods.datasetPromote, [name]);
   }
 
   async createExtent({ name, disk }) {

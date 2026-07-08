@@ -120,8 +120,27 @@ function removeDiscovered(db, mac) {
   db.prepare('DELETE FROM discovered WHERE mac = ?').run(mac);
 }
 
+function insertSafetySnapshot(db, { clientId = null, zvol, reason }) {
+  const info = db.prepare(
+    'INSERT INTO safety_snapshots (client_id, zvol, reason) VALUES (?, ?, ?)'
+  ).run(clientId, zvol, reason);
+  return info.lastInsertRowid;
+}
+
+function listExpiredSafetySnapshots(db, olderThanDays) {
+  return db.prepare(
+    `SELECT * FROM safety_snapshots
+     WHERE created_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-' || ? || ' days')`
+  ).all(olderThanDays);
+}
+
+function deleteSafetySnapshotRecord(db, id) {
+  db.prepare('DELETE FROM safety_snapshots WHERE id = ?').run(id);
+}
+
 module.exports = {
   initDb, listClients, getClient, getClientByMac, insertClient, updateClient, deleteClient,
   getSetting, setSetting, getAllSettings, logEvent, listEvents, pruneEvents,
   upsertDiscovered, listDiscovered, removeDiscovered,
+  insertSafetySnapshot, listExpiredSafetySnapshots, deleteSafetySnapshotRecord,
 };

@@ -37,3 +37,12 @@ CREATE TABLE IF NOT EXISTS discovered (
   last_seen_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   request_count INTEGER NOT NULL DEFAULT 1
 );
+
+CREATE TABLE IF NOT EXISTS safety_snapshots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  client_id INTEGER,
+  zvol TEXT NOT NULL,              -- the quarantine dataset path holding pre-wipe data
+  reason TEXT NOT NULL,            -- 'reset' | 'rebase' | 'retire'
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  FOREIGN KEY (client_id) REFERENCES clients(id)
+);

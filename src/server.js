@@ -15,18 +15,24 @@ const { createClientsRouter } = require('./routes/clients');
 const { createGoldenRouter } = require('./routes/golden');
 const { createSettingsRouter } = require('./routes/settings');
 const { createBootRouter } = require('./routes/boot');
+const { createPoolRouter } = require('./routes/pool');
+const { createReconcileRouter } = require('./routes/reconcile');
+const { createBulkImportRouter } = require('./routes/bulkImport');
+const { createTrueNasStatusRouter } = require('./routes/truenas');
 const { startSessionPoller } = require('./services/sessionPoller');
 const { startScheduler } = require('./services/scheduler');
+const { startPoolMonitor } = require('./services/poolMonitor');
 
 // client.connect() has no internal timeout, so an unreachable/slow TrueNAS box
 // would otherwise hang server startup indefinitely instead of degrading gracefully.
 const CONNECT_TIMEOUT_MS = 8000;
 
 function withTimeout(promise, ms, message) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) => setTimeout(() => reject(new Error(message)), ms)),
-  ]);
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
 async function connectTrueNAS(config) {
@@ -153,6 +159,10 @@ async function main() {
   app.use(createClientsRouter(ctx));
   app.use(createGoldenRouter(ctx));
   app.use(createSettingsRouter(ctx));
+  app.use(createPoolRouter(ctx));
+  app.use(createReconcileRouter(ctx));
+  app.use(createBulkImportRouter(ctx));
+  app.use(createTrueNasStatusRouter(ctx));
 
   app.get('/api/events', (req, res) => {
     try {
@@ -179,6 +189,10 @@ async function main() {
   // so a later settings change can still trigger a reschedule.
   ctx.rescheduleCron = scheduler.reschedule;
 
+  // Attached to ctx (not captured by routes/pool.js at construction time) so
+  // GET /api/pool/status can read the latest reading on every request.
+  ctx.poolMonitor = startPoolMonitor(ctx);
+
   const server = app.listen(config.httpPort, config.httpBind, () => {
     console.log(
       `[server] FleetDeck listening on ${config.httpBind}:${config.httpPort} ` +
@@ -191,6 +205,7 @@ async function main() {
     reconnect.stop();
     stopPoller();
     scheduler.stop();
+    if (ctx.poolMonitor) ctx.poolMonitor.stop();
     server.close();
     if (holder.client) {
       try {
