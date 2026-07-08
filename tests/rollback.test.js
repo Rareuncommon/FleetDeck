@@ -234,6 +234,29 @@ test('retireClient with an active session rejects and deletes nothing unless for
   assert.equal(db.listClients(ctx.db).length, 0);
 });
 
+test('count-only session reporting blocks reset whenever any session is active', async () => {
+  // Adapter degraded to iscsi.global.client_count: listSessions normalizes to
+  // [] (useless), so the guard must fall back to the fleet-wide count.
+  const withCount = (n) => {
+    const adapter = makeAdapter({ listSessions: () => [] });
+    adapter.sessionsGranular = false;
+    adapter.sessionCount = async () => n;
+    return adapter;
+  };
+
+  let ctx = makeCtx(withCount(2));
+  seedClient(ctx, { name: 'Client01', zvol: 'Main_pool/iscsi/client01', target_name: 'client01', mac: '00:00:00:00:00:0a' });
+  await assert.rejects(() => resetClient(ctx, 1), /can only report a count/);
+  assert.ok(!names(ctx.adapter).includes('deleteDataset'));
+
+  // Zero sessions fleet-wide: safe to proceed even without granularity.
+  ctx = makeCtx(withCount(0));
+  seedClient(ctx, { name: 'Client01', zvol: 'Main_pool/iscsi/client01', target_name: 'client01', mac: '00:00:00:00:00:0b' });
+  const row = await resetClient(ctx, 1);
+  assert.ok(names(ctx.adapter).includes('deleteDataset'));
+  assert.equal(row.id, 1);
+});
+
 test('rebaseClient reclones from the new snapshot and records it', async () => {
   const adapter = makeAdapter({
     listGoldenSnapshots: () => [

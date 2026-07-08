@@ -25,10 +25,25 @@ class TrueNASAdapter {
   constructor(client) {
     this.client = client;
     this.methods = null;
+    // null until introspect(); false means sessionsList resolved to the
+    // count-only last resort (iscsi.global.client_count), which can't say
+    // WHICH target a session belongs to. Consumers (assertNoActiveSession,
+    // the session poller) must degrade fail-safe instead of treating the
+    // normalized-empty session list as "no sessions anywhere".
+    this.sessionsGranular = null;
   }
 
   async introspect() {
     this.methods = await resolveMethods(this.client, CANDIDATES);
+    this.sessionsGranular = this.methods.sessionsList !== 'iscsi.global.client_count';
+    if (!this.sessionsGranular) {
+      console.error(
+        '[adapter] WARNING: this TrueNAS build only exposes iscsi.global.client_count — ' +
+          'FleetDeck cannot tell which target a session belongs to. Per-client booted/offline ' +
+          'status is unavailable, and destructive operations will refuse whenever ANY session ' +
+          'is active on the fleet unless forced.'
+      );
+    }
     return this.methods;
   }
 
@@ -182,6 +197,18 @@ class TrueNASAdapter {
       initiator: s.initiator || s.initiator_name || s.client || null,
       ...s,
     }));
+  }
+
+  // Fleet-wide session count that works regardless of which sessionsList
+  // method introspection resolved to — the safety net for count-only builds
+  // (see sessionsGranular), where listSessions() normalizes to [] and would
+  // otherwise read as "nothing is booted".
+  async sessionCount() {
+    this._requireIntrospected();
+    const raw = await this.client.call(this.methods.sessionsList, []);
+    if (typeof raw === 'number') return raw;
+    if (Array.isArray(raw)) return raw.length;
+    return raw == null ? 0 : 1;
   }
 }
 

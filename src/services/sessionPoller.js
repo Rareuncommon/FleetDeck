@@ -14,10 +14,27 @@ function isBooted(client, sessions) {
   });
 }
 
+// Warn once per process, not per tick — the degraded mode is a property of
+// the TrueNAS build and won't change until restart/re-introspection.
+let warnedCountOnlySessions = false;
+
 async function pollOnce(ctx) {
   const { db, adapter } = ctx;
+  // On a count-only build (sessionsGranular === false, strict so adapters
+  // without the property keep the granular path) listSessions() normalizes to
+  // [], which would flip every client to 'offline' forever. Don't pretend to
+  // know: report 'unknown' and skip the pointless RPC. Space usage below is
+  // per-dataset and unaffected, so it still updates normally.
+  const granular = adapter.sessionsGranular !== false;
+  if (!granular && !warnedCountOnlySessions) {
+    warnedCountOnlySessions = true;
+    console.error(
+      '[sessionPoller] this TrueNAS build only reports an iSCSI session count, not per-target ' +
+        "sessions — client status will show 'unknown' instead of booted/offline."
+    );
+  }
   const [sessions, clients] = await Promise.all([
-    adapter.listSessions(),
+    granular ? adapter.listSessions() : Promise.resolve([]),
     Promise.resolve(listClients(db)),
   ]);
 
@@ -25,7 +42,9 @@ async function pollOnce(ctx) {
     // One client's failure (e.g. its zvol was retired mid-poll) must not
     // abort status/space updates for the rest of the fleet this tick.
     try {
-      const status = isBooted(client, sessions) ? 'booted' : 'offline';
+      const status = granular
+        ? (isBooted(client, sessions) ? 'booted' : 'offline')
+        : 'unknown';
 
       let spaceUsed = client.space_used_bytes;
       const dataset = await adapter.queryDataset(client.zvol);

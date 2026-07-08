@@ -50,6 +50,25 @@ function targetMatches(sessionTarget, targetName) {
 
 async function assertNoActiveSession(ctx, client, force) {
   if (force) return;
+  // Strict === false: only the count-only degraded mode (set by
+  // adapter.introspect when sessionsList resolved to
+  // iscsi.global.client_count) takes this path — adapters without the
+  // property (test mocks, older code) keep the granular path below. On a
+  // count-only build listSessions() normalizes to [], which would read as
+  // "no sessions anywhere" and silently disable this guard; fail safe on the
+  // fleet-wide count instead. (The nightly scheduler always forces, so it's
+  // unaffected.)
+  if (ctx.adapter.sessionsGranular === false) {
+    const count = await ctx.adapter.sessionCount();
+    if (count > 0) {
+      throw new Error(
+        `${count} iSCSI session(s) are active somewhere on the fleet, and this TrueNAS build can ` +
+          `only report a count — not which target — so "${client.name}" cannot be proven idle; ` +
+          'pass { force: true } to proceed.'
+      );
+    }
+    return;
+  }
   const sessions = await ctx.adapter.listSessions();
   const active = (sessions || []).some((s) => targetMatches(s && s.target, client.target_name));
   if (active) {
