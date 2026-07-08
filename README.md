@@ -68,7 +68,14 @@ Set as env vars in the TrueNAS Custom App, or via `.env` for local/compose. See 
 | `CLIENT_ZVOL_ROOT` | Root dataset path where per-client clone zvols live. | `Main_pool/iscsi` |
 | `POOL_NAME` | Pool name for capacity alerting. Defaults to `CLIENT_ZVOL_ROOT`'s first path segment. | `Main_pool` |
 
-A few more tunables live in the in-app Settings panel rather than as env vars (`wol_enabled`, `pool_alert_threshold_pct`, `safety_snapshot_retention_days`, `nightly_reset_cron`) since they're safe to change at runtime without a restart.
+A few more tunables live in the in-app Settings panel rather than as env vars (`wol_enabled`, `wol_broadcast`, `pool_alert_threshold_pct`, `safety_snapshot_retention_days`, `nightly_reset_cron`) since they're safe to change at runtime without a restart.
+
+### Wake-on-LAN networking
+
+WoL magic packets are UDP broadcasts, and the container's network mode decides whether they can reach the LAN at all. With the default bridge networking (docker-compose and the TrueNAS Custom App both use it), a limited broadcast to `255.255.255.255` never leaves the bridge — WoL silently does nothing. Two options:
+
+- **Host networking** on the container — the limited broadcast goes straight out the host's NIC. This is the reliable option.
+- **Bridge networking + `wol_broadcast`** — set the `wol_broadcast` setting (Settings tab) to your LAN's directed broadcast address, e.g. `192.168.1.255`, which the bridge can route out. Note that some routers/switches drop directed broadcasts; if WoL still doesn't wake machines, use host networking instead.
 
 ### Golden-target prerequisite for client creation
 

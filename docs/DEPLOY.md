@@ -36,7 +36,14 @@ Set these in the app's environment config:
 | `CLIENT_ZVOL_ROOT` | e.g. `Main_pool/iscsi`. |
 | `POOL_NAME` | Pool name for capacity alerting, e.g. `Main_pool`. Defaults to `CLIENT_ZVOL_ROOT`'s first segment. |
 
-A few more tunables (`wol_enabled`, `pool_alert_threshold_pct`, `safety_snapshot_retention_days`, `nightly_reset_cron`) live in the in-app Settings panel, not as env vars — they take effect immediately without a restart.
+A few more tunables (`wol_enabled`, `wol_broadcast`, `pool_alert_threshold_pct`, `safety_snapshot_retention_days`, `nightly_reset_cron`) live in the in-app Settings panel, not as env vars — they take effect immediately without a restart.
+
+**Wake-on-LAN and container networking**
+
+If you enable `wol_enabled`, be aware the default bridge networking used by the Custom App (and docker-compose) blocks WoL's limited broadcast to `255.255.255.255` — the packet never leaves the bridge and machines silently don't wake. Either:
+
+- run the container with **host networking**, which sends the broadcast straight out the host's NIC (the reliable option), or
+- keep bridge networking and set the `wol_broadcast` setting (in-app Settings tab) to your LAN's **directed broadcast** address, e.g. `192.168.1.255`. Some routers/switches drop directed broadcasts — if machines still don't wake, switch to host networking.
 
 **Volume / storage**
 

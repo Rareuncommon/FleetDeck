@@ -290,10 +290,16 @@ async function reclone(ctx, clientId, { force, rebaseTo }) {
 
   const wolEnabled = getSetting(ctx.db, 'wol_enabled', '0') === '1';
   if (wolEnabled && after.mac) {
-    sendWakeOnLan(after.mac).catch((err) => {
+    // The container typically runs on a bridge network, where a limited
+    // broadcast (255.255.255.255) never leaves the bridge — the operator must
+    // set wol_broadcast to the LAN's directed broadcast (e.g. 192.168.1.255)
+    // for magic packets to reach the fleet. Read at send time so a Settings
+    // change takes effect without a restart, like the other runtime tunables.
+    const broadcastAddress = getSetting(ctx.db, 'wol_broadcast', '255.255.255.255');
+    sendWakeOnLan(after.mac, { broadcastAddress }).catch((err) => {
       logEvent(ctx.db, { action: 'client.wol.failed', clientId, after: { error: err.message } });
     });
-    logEvent(ctx.db, { action: 'client.wol.sent', clientId, after: { mac: after.mac } });
+    logEvent(ctx.db, { action: 'client.wol.sent', clientId, after: { mac: after.mac, broadcast: broadcastAddress } });
   }
   return after;
 }
