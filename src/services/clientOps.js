@@ -313,7 +313,7 @@ async function rebaseClient(ctx, clientId, { goldenSnapshot, force = false } = {
   return reclone(ctx, clientId, { force, rebaseTo: goldenSnapshot });
 }
 
-async function retireClient(ctx, clientId) {
+async function retireClient(ctx, clientId, { force = false } = {}) {
   const client = getClient(ctx.db, clientId);
   if (!client) throw new Error('Client not found');
 
@@ -326,6 +326,12 @@ async function retireClient(ctx, clientId) {
     logEvent(ctx.db, { action: 'client.retire.dryrun', clientId, before: client });
     return client;
   }
+
+  // Same live-session guard as reset/rebase (and in the same position,
+  // after the dryRun short-circuit): retiring deletes the target and zvol
+  // out from under a running Windows machine, which is at least as
+  // destructive as a reset and must demand the same explicit force.
+  await assertNoActiveSession(ctx, client, force);
 
   const leaf = leafOf(client.zvol);
 
@@ -350,8 +356,12 @@ async function retireClient(ctx, clientId) {
   await quarantineBeforeDestroy(ctx, client, clientId, 'retire');
 
   await ctx.adapter.deleteDataset(client.zvol, { recursive: true, force: true });
-  deleteClient(ctx.db, clientId);
+  // Log BEFORE deleting the row: events.client_id has an enforced FK to
+  // clients(id), so inserting this after the delete would be rejected.
+  // deleteClient detaches (nulls) the reference; before_json keeps the full
+  // client for the audit trail.
   logEvent(ctx.db, { action: 'client.retire', clientId, before: client });
+  deleteClient(ctx.db, clientId);
   return client;
 }
 

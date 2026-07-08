@@ -93,10 +93,13 @@ function createClientsRouter(ctx) {
     try {
       const id = req.params.id;
       if (!getClient(db, id)) return res.status(404).json({ error: 'Not found' });
-      await retireClient(ctx, id);
+      // Some HTTP clients won't send a DELETE body, so accept ?force=1 too.
+      const force = !!(req.body && req.body.force)
+        || req.query.force === '1' || req.query.force === 'true';
+      await retireClient(ctx, id, { force });
       return res.status(200).json({ ok: true });
     } catch (err) {
-      return res.status(500).json({ error: err.message });
+      return res.status(opErrorStatus(err.message)).json({ error: err.message });
     }
   });
 

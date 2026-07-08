@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 
 const db = require('../src/db');
 const {
-  createClient, resetClient, rebaseClient,
+  createClient, resetClient, rebaseClient, retireClient,
 } = require('../src/services/clientOps');
 
 // Real in-memory SQLite via the actual db module — no mocking of the data
@@ -202,6 +202,36 @@ test('resetClient with an active session throws unless force=true', async () => 
   assert.ok(seq.includes('deleteDataset'));
   assert.ok(seq.includes('cloneSnapshot'));
   assert.equal(row.id, 1);
+});
+
+test('retireClient with an active session rejects and deletes nothing unless forced', async () => {
+  const withSession = () => makeAdapter({
+    listSessions: () => [{ target: 'client01', initiator: 'iqn.pc' }],
+    // Retire looks the target/extent up by the client's own name here, so the
+    // default golden-target fixture would be the wrong row to return.
+    queryTargets: () => [{ id: 3, name: 'client01', groups: [{ portal: 1 }] }],
+    queryExtents: () => [{ id: 5, name: 'client01' }],
+    queryTargetExtents: () => [{ id: 8, target: 3 }],
+  });
+
+  let adapter = withSession();
+  let ctx = makeCtx(adapter);
+  seedClient(ctx, { name: 'Client01', zvol: 'Main_pool/iscsi/client01', target_name: 'client01', mac: '00:00:00:00:00:08' });
+  await assert.rejects(() => retireClient(ctx, 1), /active iSCSI session/);
+  const seq = names(adapter);
+  assert.ok(!seq.some((n) => n.startsWith('delete')), `expected no delete calls, got: ${seq}`);
+  assert.equal(db.listClients(ctx.db).length, 1); // row survives
+
+  adapter = withSession();
+  ctx = makeCtx(adapter);
+  seedClient(ctx, { name: 'Client01', zvol: 'Main_pool/iscsi/client01', target_name: 'client01', mac: '00:00:00:00:00:09' });
+  await retireClient(ctx, 1, { force: true });
+  const forced = names(adapter);
+  assert.ok(forced.includes('deleteTargetExtent'));
+  assert.ok(forced.includes('deleteTarget'));
+  assert.ok(forced.includes('deleteExtent'));
+  assert.ok(forced.includes('deleteDataset'));
+  assert.equal(db.listClients(ctx.db).length, 0);
 });
 
 test('rebaseClient reclones from the new snapshot and records it', async () => {

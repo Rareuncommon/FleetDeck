@@ -56,7 +56,20 @@ function updateClient(db, id, fields) {
 }
 
 function deleteClient(db, id) {
-  db.prepare('DELETE FROM clients WHERE id = ?').run(id);
+  // better-sqlite3 enforces foreign keys by default, and events /
+  // safety_snapshots reference clients(id) with no ON DELETE clause — so
+  // deleting a client that has any audit or quarantine row (every client
+  // does, from client.create) would throw SQLITE_CONSTRAINT_FOREIGNKEY.
+  // Detach the references instead of deleting them: audit history and
+  // quarantine tracking must outlive the client row (events keep the full
+  // client in before_json/after_json, and the safety-snapshot purge works
+  // off the zvol path alone).
+  const detachAndDelete = db.transaction((cid) => {
+    db.prepare('UPDATE events SET client_id = NULL WHERE client_id = ?').run(cid);
+    db.prepare('UPDATE safety_snapshots SET client_id = NULL WHERE client_id = ?').run(cid);
+    db.prepare('DELETE FROM clients WHERE id = ?').run(cid);
+  });
+  detachAndDelete(id);
 }
 
 function getSetting(db, key, defaultValue = null) {

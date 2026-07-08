@@ -350,7 +350,17 @@ $("#dashboard").addEventListener("click", async e => {
       await api("POST", `/api/clients/${id}/nightly-reset`, { enabled }); loadClients();
     } else if (act === "retire") {
       const name = b.dataset.name;
-      if (prompt(`Type "${name}" to retire this client:`) === name) { await api("DELETE", `/api/clients/${id}`); loadClients(); }
+      if (prompt(`Type "${name}" to retire this client:`) === name) {
+        // Same force-retry pattern as reset: a session conflict (409) offers
+        // one explicit confirm before destroying a disk that's in use.
+        try { await api("DELETE", `/api/clients/${id}`); }
+        catch (err) {
+          if (/session/i.test(err.message) && confirm(err.message + "\nForce retire?"))
+            await api("DELETE", `/api/clients/${id}`, { force: true });
+          else throw err;
+        }
+        loadClients();
+      }
     } else if (act === "adopt") {
       const name = prompt("Name for " + b.dataset.mac + ":");
       if (name) { await api("POST", `/api/discovered/${encodeURIComponent(b.dataset.mac)}/adopt`, { name }); loadClients(); loadDiscovered(); }
