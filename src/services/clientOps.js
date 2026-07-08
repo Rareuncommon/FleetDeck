@@ -108,6 +108,46 @@ async function resolveDefaultGolden(ctx) {
   return { id: last.id, name: last.name };
 }
 
+// A target's `groups` (portal + initiator-group bindings) is what makes it
+// visible to initiators at all, and the correct portal/initiator ids are
+// site-specific — we can't invent them. Copy them from a known-working target
+// instead: preferably the golden target (it demonstrably boots on the right
+// portal), else any existing target that has groups. Keep only the
+// create-schema fields per group — query results may carry extra decoration
+// (e.g. row ids) that iscsi.target.create would reject or misinterpret.
+function copyCreateGroups(groups) {
+  return groups.map((g) => ({
+    portal: g.portal,
+    initiator: g.initiator != null ? g.initiator : null,
+    authmethod: g.authmethod || 'NONE',
+    auth: g.auth != null ? g.auth : null,
+    auth_networks: Array.isArray(g.auth_networks) ? [...g.auth_networks] : [],
+  }));
+}
+
+function hasGroups(target) {
+  return target && Array.isArray(target.groups) && target.groups.length > 0;
+}
+
+async function resolveTargetGroups(ctx) {
+  const goldenTargetName = leafOf(ctx.config.goldenZvol);
+  const goldenRows = await ctx.adapter.queryTargets([['name', '=', goldenTargetName]]);
+  const golden = (Array.isArray(goldenRows) ? goldenRows : []).find(hasGroups);
+  if (golden) {
+    return { groups: copyCreateGroups(golden.groups), copiedFrom: golden.name || goldenTargetName };
+  }
+  const allRows = await ctx.adapter.queryTargets([]);
+  const fallback = (Array.isArray(allRows) ? allRows : []).find(hasGroups);
+  if (fallback) {
+    return { groups: copyCreateGroups(fallback.groups), copiedFrom: fallback.name };
+  }
+  throw new Error(
+    `No existing iSCSI target with portal groups found to copy from (looked for "${goldenTargetName}" first, ` +
+      'then any target). Create at least one working target — e.g. the golden target — in the TrueNAS UI ' +
+      'so FleetDeck has a portal/initiator group configuration to copy for new clients.'
+  );
+}
+
 async function rollback(ctx, created) {
   // Reverse order; swallow (log) errors so a rollback failure can't mask the
   // original error that triggered the unwind.
@@ -156,6 +196,9 @@ async function createClient(ctx, { name, mac }) {
   }
 
   const golden = await resolveDefaultGolden(ctx);
+  // Resolve portal groups BEFORE any mutation: if no template target exists,
+  // creation aborts here with nothing created and nothing to roll back.
+  const targetGroups = await resolveTargetGroups(ctx);
   const created = [];
   try {
     await ctx.adapter.cloneSnapshot(golden.id, zvol);
@@ -164,7 +207,7 @@ async function createClient(ctx, { name, mac }) {
     const extentId = await ctx.adapter.createExtent({ name: leaf, disk: `zvol/${zvol}` });
     created.push({ type: 'extent', ref: extentId });
 
-    const targetId = await ctx.adapter.createTarget({ name: leaf, iqn: ctx.config.iqnPrefix });
+    const targetId = await ctx.adapter.createTarget({ name: leaf, groups: targetGroups.groups });
     created.push({ type: 'target', ref: targetId });
 
     const targetExtentId = await ctx.adapter.createTargetExtent({ targetId, extentId, lunId: 0 });
@@ -176,7 +219,10 @@ async function createClient(ctx, { name, mac }) {
     logEvent(ctx.db, {
       action: 'client.create',
       clientId: newId,
-      after: { name, mac, zvol, target_name: leaf, golden_snapshot: golden.name },
+      after: {
+        name, mac, zvol, target_name: leaf, golden_snapshot: golden.name,
+        target_groups_copied_from: targetGroups.copiedFrom,
+      },
     });
     return getClient(ctx.db, newId);
   } catch (err) {

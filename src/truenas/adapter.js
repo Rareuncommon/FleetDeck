@@ -113,11 +113,22 @@ class TrueNASAdapter {
       : result;
   }
 
-  async createTarget({ name, iqn }) {
+  // Verified against the v25.10 schema (iscsi.target.create): `groups` is what
+  // binds a target to a portal (and optionally an initiator group), and it
+  // DEFAULTS TO [] — a target created without groups is not published on any
+  // portal, so initiators can never see or connect to it. That's why an empty
+  // `groups` is a hard error here instead of a silent default. (`alias` is just
+  // a human-readable label — the full IQN is derived by TrueNAS as
+  // `<global basename>:<name>` — so we don't send it at all.)
+  async createTarget({ name, groups }) {
     this._requireIntrospected();
-    // Best-guess field shape pending live TrueNAS verification.
+    if (!Array.isArray(groups) || groups.length === 0) {
+      throw new Error(
+        `Refusing to create iSCSI target "${name}" with no portal groups: it would be invisible to initiators.`
+      );
+    }
     const result = await this.client.call(this.methods.targetCreate, [
-      { name, alias: iqn },
+      { name, mode: 'ISCSI', groups },
     ]);
     return (result && result.id != null) ? result.id : result;
   }

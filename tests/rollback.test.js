@@ -27,7 +27,16 @@ function makeAdapter(overrides = {}) {
     if (name === 'createTarget') return 'target-1';
     if (name === 'createTargetExtent') return 'te-1';
     if (name === 'listSessions') return [];
-    if (name === 'queryTargets' || name === 'queryExtents' || name === 'queryTargetExtents') return [];
+    // Default fleet has a working golden target whose portal groups new
+    // clients copy (see clientOps.resolveTargetGroups); the extra `id` field
+    // mimics query-result decoration that must be stripped before create.
+    if (name === 'queryTargets') {
+      return [{
+        id: 9, name: 'golden',
+        groups: [{ id: 1, portal: 1, initiator: null, authmethod: 'NONE', auth: null, auth_networks: [] }],
+      }];
+    }
+    if (name === 'queryExtents' || name === 'queryTargetExtents') return [];
     return undefined;
   };
   const methods = [
@@ -71,7 +80,7 @@ test('createClient happy path calls in order and inserts a client', async () => 
   const row = await createClient(ctx, { name: 'Client01', mac: 'aa:bb:cc:dd:ee:ff' });
 
   assert.deepEqual(names(adapter), [
-    'listGoldenSnapshots', 'cloneSnapshot', 'createExtent', 'createTarget', 'createTargetExtent',
+    'listGoldenSnapshots', 'queryTargets', 'cloneSnapshot', 'createExtent', 'createTarget', 'createTargetExtent',
   ]);
   assert.equal(row.name, 'Client01');
   assert.equal(row.zvol, 'Main_pool/iscsi/client01');
@@ -82,6 +91,31 @@ test('createClient happy path calls in order and inserts a client', async () => 
   const clone = adapter.calls.find((c) => c.name === 'cloneSnapshot');
   assert.equal(clone.args[0], 'snap-1'); // resolved id, not the name
   assert.equal(clone.args[1], 'Main_pool/iscsi/client01');
+
+  // Portal groups are copied from the golden target, stripped down to the
+  // iscsi.target.create schema fields (no `id` decoration from the query).
+  const target = adapter.calls.find((c) => c.name === 'createTarget');
+  assert.deepEqual(target.args[0], {
+    name: 'client01',
+    groups: [{ portal: 1, initiator: null, authmethod: 'NONE', auth: null, auth_networks: [] }],
+  });
+});
+
+test('createClient throws and touches nothing when no target with groups exists', async () => {
+  const adapter = makeAdapter({
+    queryTargets: () => [],
+  });
+  const ctx = makeCtx(adapter);
+
+  await assert.rejects(
+    () => createClient(ctx, { name: 'Client04', mac: '0a:0b:0c:0d:0e:0f' }),
+    /No existing iSCSI target with portal groups/
+  );
+
+  // Both queryTargets probes (golden by name, then any target) ran, but no
+  // mutation and no rollback ever happened — nothing was created.
+  assert.deepEqual(names(adapter), ['listGoldenSnapshots', 'queryTargets', 'queryTargets']);
+  assert.equal(db.listClients(ctx.db).length, 0);
 });
 
 test('createClient rolls back created objects in reverse when a mid-step fails', async () => {
@@ -102,7 +136,7 @@ test('createClient rolls back created objects in reverse when a mid-step fails',
   // dataset + extent existed before the failing createTarget; tear down in
   // reverse (extent then dataset). target/targetExtent were never created.
   assert.deepEqual(names(adapter), [
-    'listGoldenSnapshots', 'cloneSnapshot', 'createExtent', 'createTarget',
+    'listGoldenSnapshots', 'queryTargets', 'cloneSnapshot', 'createExtent', 'createTarget',
     'deleteExtent', 'deleteDataset',
   ]);
   const delExtent = adapter.calls.find((c) => c.name === 'deleteExtent');
@@ -121,7 +155,7 @@ test('createClient rollback tears down all four objects when the last step fails
   await assert.rejects(() => createClient(ctx, { name: 'Client03', mac: 'a1:b2:c3:d4:e5:f6' }));
 
   assert.deepEqual(names(adapter), [
-    'listGoldenSnapshots', 'cloneSnapshot', 'createExtent', 'createTarget', 'createTargetExtent',
+    'listGoldenSnapshots', 'queryTargets', 'cloneSnapshot', 'createExtent', 'createTarget', 'createTargetExtent',
     'deleteTarget', 'deleteExtent', 'deleteDataset',
   ]);
   assert.equal(db.listClients(ctx.db).length, 0);

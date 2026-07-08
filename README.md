@@ -70,6 +70,10 @@ Set as env vars in the TrueNAS Custom App, or via `.env` for local/compose. See 
 
 A few more tunables live in the in-app Settings panel rather than as env vars (`wol_enabled`, `pool_alert_threshold_pct`, `safety_snapshot_retention_days`, `nightly_reset_cron`) since they're safe to change at runtime without a restart.
 
+### Golden-target prerequisite for client creation
+
+New clients copy their iSCSI portal/initiator group configuration from an existing, working target — preferably the target for the golden zvol (e.g. `win-golden`), else any target that has portal groups. Those groups are what publish a target on a portal; without them a target is invisible to initiators, and the correct portal/initiator ids are site-specific, so FleetDeck refuses to guess. Before creating your first client, create at least one working target (the golden target) in the TrueNAS UI with the portal group your fleet boots from. If none exists, client creation fails with a descriptive error before anything is created.
+
 ### Safety-snapshot prerequisite
 
 The auto safety-snapshot feature clones each pre-wipe zvol into `<CLIENT_ZVOL_ROOT>/_safety/...` before destroying it. ZFS clone does not create intermediate datasets, so the `_safety` dataset must exist under your client zvol root *before* the first reset/rebase/retire, e.g.:

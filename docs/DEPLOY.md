@@ -43,6 +43,10 @@ A few more tunables (`wol_enabled`, `pool_alert_threshold_pct`, `safety_snapshot
 - Add a **host-path volume** mounting a persistent dataset to `/data` in the container.
 - This is where the SQLite file (`DB_PATH`) lives. Without it, all client/event state is lost on every app restart or upgrade.
 
+**One-time golden target for client creation**
+
+FleetDeck creates each new client's iSCSI target by copying the portal/initiator group configuration from an existing, working target — preferably the golden zvol's target (e.g. `win-golden`), else any target that has portal groups. Portal groups are what publish a target on a portal; the right portal/initiator ids are site-specific, so FleetDeck copies rather than guesses. Before creating the first client, make sure at least one working target exists in the TrueNAS UI (**Shares > iSCSI > Targets**) bound to the portal your fleet boots from. If none exists, client creation fails up front with nothing created.
+
 **One-time dataset for the safety-snapshot feature**
 
 Every reset/rebase/retire quarantine-clones the client's pre-wipe zvol into `<CLIENT_ZVOL_ROOT>/_safety/...` before destroying it, as a brief undo window. ZFS clone does not create intermediate datasets, so create the parent once before first use:
