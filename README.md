@@ -4,7 +4,7 @@ FleetDeck is a single-container web app that manages a diskless Windows gaming f
 
 ## Features
 
-- **Dashboard** — live view of every client, its zvol clone, iSCSI target, and last boot.
+- **Dashboard** — live view of every client, its zvol clone, iSCSI target, and last boot; updates are pushed over a WebSocket (`/ws`, same session auth) with automatic fallback to polling. Sortable/searchable client table with pagination, bulk actions (reset/retire/rebase/nightly), a per-client detail drawer with audit history and snapshot lineage, and a Cmd/Ctrl+K command palette.
 - **One-click client lifecycle** — create, reset, rebase, retire, and promote-golden, each a single action against TrueNAS.
 - **Bulk reset + nightly cron** — reset the whole fleet at once, or on a schedule (`node-cron`) for a clean image every morning.
 - **iPXE script serving** — serves per-client boot scripts at `/boot/<mac-hexhyp>.ipxe`, with an unknown-MAC discovery/adopt flow so new machines show up in the dashboard ready to be provisioned.

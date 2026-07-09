@@ -22,6 +22,7 @@ const { createTrueNasStatusRouter } = require('./routes/truenas');
 const { startSessionPoller } = require('./services/sessionPoller');
 const { startScheduler } = require('./services/scheduler');
 const { startPoolMonitor } = require('./services/poolMonitor');
+const { createPushChannel } = require('./services/push');
 
 // client.connect() has no internal timeout, so an unreachable/slow TrueNAS box
 // would otherwise hang server startup indefinitely instead of degrading gracefully.
@@ -72,10 +73,19 @@ function startReconnectLoop(ctx, holder) {
   let stopped = false;
   let timer = null;
 
+  // ctx.push is attached after app.listen(), later than this loop starts —
+  // read it live and tolerate its absence (an early state change before the
+  // channel exists has no tabs to tell anyway; each new socket is greeted
+  // with the current state on connect).
+  function pushState(connected) {
+    if (ctx.push) ctx.push.broadcast('truenas', { connected });
+  }
+
   function onDisconnected() {
     if (stopped) return;
     console.error('[server] TrueNAS connection dropped; will retry with backoff');
     ctx.adapter = null;
+    pushState(false);
     scheduleAttempt();
   }
 
@@ -87,6 +97,7 @@ function startReconnectLoop(ctx, holder) {
       ctx.adapter = adapter;
       backoffMs = RECONNECT_MIN_MS;
       console.log('[server] TrueNAS (re)connected and resolved RPC methods');
+      pushState(true);
       client.on('disconnected', onDisconnected);
     } catch (err) {
       console.error(`[server] TrueNAS reconnect attempt failed: ${err.message}`);
@@ -177,7 +188,16 @@ async function main() {
         }
         limit = Math.min(parsed, 1000);
       }
-      return res.status(200).json(listEvents(db, { limit }));
+      // Optional per-client filter for the dashboard's detail drawer.
+      let clientId = null;
+      if (req.query.client_id !== undefined) {
+        const parsed = parseInt(req.query.client_id, 10);
+        if (!Number.isInteger(parsed) || parsed <= 0) {
+          return res.status(400).json({ error: 'client_id must be a positive integer' });
+        }
+        clientId = parsed;
+      }
+      return res.status(200).json(listEvents(db, { limit, clientId }));
     } catch (err) {
       return res.status(500).json({ error: err.message });
     }
@@ -200,12 +220,17 @@ async function main() {
     );
   });
 
+  // Live-update WebSocket channel at /ws (cookie-authenticated at upgrade).
+  // Additive: the REST API and the frontend's polling fallback stay intact.
+  ctx.push = createPushChannel(server, ctx);
+
   const shutdown = async (signal) => {
     console.log(`[server] received ${signal}, shutting down`);
     reconnect.stop();
     stopPoller();
     scheduler.stop();
     if (ctx.poolMonitor) ctx.poolMonitor.stop();
+    if (ctx.push) ctx.push.stop();
     server.close();
     if (holder.client) {
       try {

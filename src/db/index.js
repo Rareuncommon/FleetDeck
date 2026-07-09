@@ -1,6 +1,17 @@
 const fs = require('fs');
 const path = require('path');
+const EventEmitter = require('events');
 const Database = require('better-sqlite3');
+
+// Change feed for the WebSocket push channel (services/push.js). Emitting from
+// inside the db helpers — rather than threading a broadcast callback through
+// every route/service — means no call site changes and nothing can mutate
+// state without the UI hearing about it. Module-level is fine here: the app is
+// a single process with a single live DB (tests open :memory: copies, but
+// nothing subscribes in tests, so stray emits are inert).
+const changes = new EventEmitter();
+// A push channel that is slow to attach must never crash a mutation path.
+changes.setMaxListeners(20);
 
 const CLIENT_COLUMNS = [
   'name', 'mac', 'zvol', 'target_name', 'golden_snapshot', 'raw_override',
@@ -43,6 +54,7 @@ function insertClient(db, client) {
     golden_snapshot: client.golden_snapshot,
     notes: client.notes ?? null,
   });
+  changes.emit('clients_changed', { op: 'insert', id: info.lastInsertRowid });
   return info.lastInsertRowid;
 }
 
@@ -53,6 +65,7 @@ function updateClient(db, id, fields) {
   const params = { id };
   for (const k of keys) params[k] = fields[k];
   db.prepare(`UPDATE clients SET ${assignments} WHERE id = @id`).run(params);
+  changes.emit('clients_changed', { op: 'update', id, fields: keys });
 }
 
 function deleteClient(db, id) {
@@ -70,6 +83,7 @@ function deleteClient(db, id) {
     db.prepare('DELETE FROM clients WHERE id = ?').run(cid);
   });
   detachAndDelete(id);
+  changes.emit('clients_changed', { op: 'delete', id });
 }
 
 function getSetting(db, key, defaultValue = null) {
@@ -92,7 +106,7 @@ function getAllSettings(db) {
 }
 
 function logEvent(db, { action, clientId = null, before = null, after = null, actor = 'system' }) {
-  db.prepare(
+  const info = db.prepare(
     `INSERT INTO events (action, client_id, actor, before_json, after_json)
      VALUES (?, ?, ?, ?, ?)`
   ).run(
@@ -102,9 +116,28 @@ function logEvent(db, { action, clientId = null, before = null, after = null, ac
     before === null ? null : JSON.stringify(before),
     after === null ? null : JSON.stringify(after)
   );
+  // Emit the row as the API serves it (before/after re-stringified) so the
+  // push channel and GET /api/events agree on shape and the frontend needs
+  // exactly one rendering path for both.
+  changes.emit('event', {
+    id: info.lastInsertRowid,
+    ts: new Date().toISOString(),
+    action,
+    client_id: clientId,
+    actor,
+    before_json: before === null ? null : JSON.stringify(before),
+    after_json: after === null ? null : JSON.stringify(after),
+  });
 }
 
-function listEvents(db, { limit = 100 } = {}) {
+// clientId filter powers the per-client audit history in the dashboard's
+// detail drawer; the unfiltered form remains the Audit tab's full feed.
+function listEvents(db, { limit = 100, clientId = null } = {}) {
+  if (clientId != null) {
+    return db.prepare(
+      'SELECT * FROM events WHERE client_id = ? ORDER BY id DESC LIMIT ?'
+    ).all(clientId, limit);
+  }
   return db.prepare('SELECT * FROM events ORDER BY id DESC LIMIT ?').all(limit);
 }
 
@@ -156,4 +189,5 @@ module.exports = {
   getSetting, setSetting, getAllSettings, logEvent, listEvents, pruneEvents,
   upsertDiscovered, listDiscovered, removeDiscovered,
   insertSafetySnapshot, listExpiredSafetySnapshots, deleteSafetySnapshotRecord,
+  changes,
 };
