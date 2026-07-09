@@ -15,8 +15,13 @@ In the TrueNAS SCALE UI: **Apps > Discover Apps > Custom App** (labeled "Launch 
 **Port mapping**
 
 - Container port `8080` → a host port on the LAN, e.g. `8080`.
-- FleetDeck serves the UI, API, and `/boot/*` all on this one port.
+- FleetDeck serves the UI, API, live-update WebSocket (`/ws`), and `/boot/*` all on this one port.
 - Because `/boot/*` is unauthenticated (firmware can't log in), keep this on the LAN only.
+
+**Frontend and live updates**
+
+- The web UI is plain static files (`index.html`, `app.css`, `app.js`) — there is **no build step**, so deployment is unchanged: build the image, run it. Nothing to compile.
+- The dashboard receives live updates over a WebSocket at `/ws` on the same port, authenticated with the same session cookie as the API. If you put a reverse proxy in front of FleetDeck, it must pass WebSocket upgrades through for `/ws` (e.g. nginx `proxy_set_header Upgrade/Connection`); if it doesn't, nothing breaks — the UI automatically falls back to its 10-second polling.
 
 **Environment variables**
 
