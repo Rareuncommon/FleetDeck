@@ -1,6 +1,7 @@
 'use strict';
 
 const { listClients, updateClient } = require('../db');
+const { expireGoldenBuild } = require('./goldenBuild');
 
 function isBooted(client, sessions) {
   return sessions.some((session) => {
@@ -67,6 +68,16 @@ async function pollOnce(ctx) {
 
 function startSessionPoller(ctx, intervalMs = 10000) {
   const tick = async () => {
+    // Golden Build Mode expiry piggybacks on this cadence (no separate cron).
+    // It's DB-only, so run it BEFORE the adapter guard below — an armed
+    // session's boot-serving window must close on time even during a TrueNAS
+    // outage. It cannot disconnect a live iSCSI session (see expireGoldenBuild).
+    try {
+      expireGoldenBuild(ctx);
+    } catch (err) {
+      console.error('[sessionPoller] golden build expiry failed:', err);
+    }
+
     // DRY_RUN only gates mutating TrueNAS calls (see clientOps.js); read-only
     // polling must still run so the dashboard reflects live session/space data.
     // Only skip when there's no live adapter to poll at all.

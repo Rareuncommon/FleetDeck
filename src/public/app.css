@@ -20,6 +20,11 @@ button { background: var(--panel2); border: 1px solid var(--border); color: var(
 button:hover { border-color: var(--accent-d); }
 button.accent { background: var(--accent-d); border-color: var(--accent); color: #062b28; font-weight: 600; }
 button.danger:hover { border-color: var(--red); color: var(--red); }
+/* Amber — Golden Build Mode. Deliberately NOT the teal primary tone: this
+   grants direct write access to the live golden image, so it must read as a
+   warning, distinct from the safe "Adopt" action beside it. */
+button.warn { background: rgba(217, 164, 65, .14); border-color: var(--amber); color: var(--amber); font-weight: 600; }
+button.warn:hover { border-color: var(--amber); background: rgba(217, 164, 65, .24); }
 button:disabled { opacity: .4; cursor: default; }
 input, select, textarea { background: #0c0c0c; border: 1px solid var(--border);
   color: var(--text); padding: 4px 6px; border-radius: 3px; font: inherit; font-size: 12px; }
@@ -124,6 +129,20 @@ pre { background: #0c0c0c; border: 1px solid var(--border); padding: var(--s2); 
   background-size: 400% 100%; animation: shimmer 1.4s ease infinite; border-radius: 3px; color: transparent !important; }
 @keyframes shimmer { 0% { background-position: 100% 0; } 100% { background-position: 0 0; } }
 .skel-row td > span { display: inline-block; min-width: 60px; }
+
+/* ---- Golden Build Mode active-session banner ----
+   Full-width, amber, impossible to miss: when it's showing, the live golden
+   image is writable by a booted machine and every future clone inherits
+   whatever that machine changes. */
+.gb-banner { border: 1px solid var(--amber); background: rgba(217, 164, 65, .12);
+  border-radius: 4px; padding: var(--s3) var(--s4); margin-bottom: var(--s4);
+  display: flex; align-items: center; gap: var(--s4); flex-wrap: wrap; }
+.gb-banner .icon { font-size: 20px; }
+.gb-banner .headline { font-weight: 700; color: var(--amber); }
+.gb-banner .detail { font-size: 12px; color: var(--dim); }
+.gb-banner .detail .mono { color: var(--text); }
+.gb-banner .spacer { flex: 1; }
+.gb-banner .remain { font-family: var(--mono); color: var(--text); font-weight: 600; }
 
 /* ---- Empty states ---- */
 .empty { text-align: center; padding: var(--s6) var(--s4); color: var(--dim); }

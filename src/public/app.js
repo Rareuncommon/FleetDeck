@@ -148,6 +148,7 @@ const state = {
   loadedClientsOnce: false,   // gates the skeleton row rendering
   wsConnected: false,
   truenasConnected: null,     // null until the first ws greeting
+  goldenBuild: null,          // active golden build session row, or null
 };
 const PER_PAGE = 50;
 
@@ -389,11 +390,17 @@ async function loadDiscovered() {
   if (!list.length) { body.innerHTML = '<tr><td colspan="5" class="muted">None</td></tr>'; return; }
   for (const d of list) {
     const tr = el("tr");
+    // Two distinct actions: Adopt (safe — clones golden into a new managed
+    // client) and Golden Build Mode (dangerous — sanhooks this MAC directly
+    // into the live golden image). They must never be confused, hence the
+    // separate amber button and the confirmation modal it opens.
     tr.innerHTML = `<td class="mono">${esc(d.mac)}</td><td class="muted">${fmtTime(d.first_seen_at)}</td>
       <td class="muted">${fmtTime(d.last_seen_at)}</td><td>${esc(d.request_count)}</td>
-      <td><button class="accent" data-act="adopt" data-mac="${esc(d.mac)}">Adopt</button></td>`;
+      <td class="actions"><button class="accent" data-act="adopt" data-mac="${esc(d.mac)}">Adopt</button>
+      <button class="warn" data-act="golden-build" data-mac="${esc(d.mac)}">Boot into Golden Build Mode</button></td>`;
     body.appendChild(tr);
   }
+  applyGoldenBuildDisabled();
 }
 
 /* ====================== Row + bulk client actions ======================= */
@@ -463,6 +470,8 @@ $("#dashboard").addEventListener("click", async (e) => {
       await api("POST", `/api/discovered/${encodeURIComponent(b.dataset.mac)}/adopt`, { name: vals.name.trim() });
       toast(`Adopted ${vals.name.trim()}`);
       loadClients(); loadDiscovered();
+    } else if (act === "golden-build") {
+      await goldenBuildArmFlow(b.dataset.mac);
     }
   } catch (err) {
     if (err.message !== "unauthorized") toast(err.message, "err");
@@ -732,9 +741,118 @@ async function refreshDrawerEvents() {
   }).join("") : '<div class="muted">No events for this client.</div>';
 }
 
+/* ======================= Golden Build Mode =============================
+ * Distinct from Adopt: arming a MAC sanhooks it directly into the LIVE
+ * golden zvol (no clone), so its writes land permanently on the image every
+ * future client is cloned from. Status is polled (state.goldenBuild) and
+ * drives both the Golden-tab banner and the discovered-list disabled state.
+ */
+
+async function goldenBuildArmFlow(mac) {
+  if (state.goldenBuild) {
+    toast(`Golden Build Mode is already armed for ${state.goldenBuild.mac}. End it first.`, "err");
+    return;
+  }
+  const vals = await openModal({
+    title: "Boot into Golden Build Mode",
+    danger: true,
+    confirmText: "Arm Golden Build Mode",
+    bodyHTML: `
+      <p><b style="color:var(--amber)">This is not Adopt.</b> Machine
+      <b class="mono" style="color:var(--text)">${esc(mac)}</b> will boot with
+      <b>direct write access to the live golden image</b> — <b>not</b> a clone.
+      Anything it changes lands permanently on <span class="mono">win-golden</span>
+      and every client cloned from it afterward.</p>
+      <p>Only one machine can be armed at a time. The session auto-expires after
+      the duration below (expiry stops future boots but can't disconnect a live
+      session).</p>`,
+    fields: [{ name: "duration", label: "Duration (minutes)", value: "240", placeholder: "240" }],
+  });
+  if (!vals) return;
+  const body = { mac };
+  const dur = parseInt(vals.duration, 10);
+  if (Number.isInteger(dur) && dur > 0) body.duration_minutes = dur;
+  try {
+    const session = await api("POST", "/api/golden-build/arm", body);
+    state.goldenBuild = session;
+    toast(`Golden Build Mode armed for ${session.mac}`, "ok");
+    renderGoldenBuildBanner();
+    applyGoldenBuildDisabled();
+    loadDiscovered();
+  } catch (err) {
+    toast(err.message, "err");
+  }
+}
+
+async function loadGoldenBuildStatus() {
+  try {
+    const r = await api("GET", "/api/golden-build/status");
+    state.goldenBuild = (r && r.active) || null;
+  } catch (e) { return; }
+  renderGoldenBuildBanner();
+  applyGoldenBuildDisabled();
+}
+
+function fmtRemaining(expiresAt) {
+  const ms = new Date(expiresAt) - Date.now();
+  if (isNaN(ms)) return "—";
+  if (ms <= 0) return "expiring…";
+  const totalMin = Math.floor(ms / 60000);
+  const h = Math.floor(totalMin / 60), m = totalMin % 60, s = Math.floor((ms % 60000) / 1000);
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
+function renderGoldenBuildBanner() {
+  const root = $("#golden-build-banner");
+  if (!root) return;
+  const gb = state.goldenBuild;
+  if (!gb) { root.innerHTML = ""; return; }
+  root.innerHTML = `<div class="gb-banner">
+    <span class="icon">⚠️</span>
+    <div>
+      <div class="headline">Golden Build Mode is ACTIVE</div>
+      <div class="detail">Machine <span class="mono">${esc(gb.mac)}</span> has direct write access to the live golden image. Every client cloned or reset after this session inherits its changes.</div>
+    </div>
+    <span class="spacer"></span>
+    <div class="detail">Auto-expires in <span class="remain">${esc(fmtRemaining(gb.expires_at))}</span></div>
+    <button class="danger" id="gb-end">End session</button>
+  </div>`;
+  const endBtn = $("#gb-end");
+  if (endBtn) endBtn.addEventListener("click", goldenBuildEndFlow);
+}
+
+async function goldenBuildEndFlow() {
+  const ok = await confirmModal("End Golden Build session",
+    `<p>Stop serving the golden-build boot script. Note: if the machine is currently connected, this does <b>not</b> disconnect its live iSCSI session — it only prevents future golden-build boots.</p>`,
+    { danger: true, confirmText: "End session" });
+  if (!ok) return;
+  try {
+    await api("POST", "/api/golden-build/end");
+    state.goldenBuild = null;
+    toast("Golden Build Mode ended", "ok");
+    renderGoldenBuildBanner();
+    applyGoldenBuildDisabled();
+    loadDiscovered();
+  } catch (err) { toast(err.message, "err"); }
+}
+
+// Only one session at a time, so once armed, every "Boot into Golden Build
+// Mode" button is disabled until the session ends (drives the UI off the same
+// active-session query the backend enforces the invariant with).
+function applyGoldenBuildDisabled() {
+  const active = !!state.goldenBuild;
+  for (const btn of $$('#discovered-body button[data-act="golden-build"]')) {
+    btn.disabled = active;
+    btn.title = active ? `Golden Build Mode already armed for ${state.goldenBuild.mac}` : "";
+  }
+}
+
 /* ============================ Golden tab ================================ */
 
 async function loadGolden() {
+  await loadGoldenBuildStatus();
   let snaps = [];
   try { snaps = await api("GET", "/api/golden/snapshots"); } catch (e) { return; }
   state.goldenNames = snaps.map((s) => s.name);
@@ -886,6 +1004,10 @@ const SETTINGS_DEFAULTS = {
   wol_broadcast: "255.255.255.255",
   pool_alert_threshold_pct: "85",
   safety_snapshot_retention_days: "3",
+  // Golden Build Mode: the WinPE chain script served on the separate ipxeboot
+  // container. Must be set before Golden Build Mode can be armed.
+  winpe_chain_url: "",
+  golden_build_default_minutes: "240",
 };
 async function loadSettings() {
   let s = {};
@@ -1066,6 +1188,8 @@ $("#login-form").addEventListener("submit", async (e) => {
 });
 
 let pollTimer = null;
+let goldenBuildTimer = null;
+let goldenBuildCountdown = null;
 async function boot() {
   renderClients();          // skeletons until data lands
   renderStatTiles(null);
@@ -1085,6 +1209,15 @@ async function boot() {
     renderStamp();
     loadDiscovered();
     connectWS();
+    // Golden Build status is fetched globally (cheap) so the Golden-tab banner
+    // and the discovered-list disabled state stay live regardless of tab, and
+    // so expiry is reflected even if nobody is on the Golden tab.
+    loadGoldenBuildStatus();
+    if (!goldenBuildTimer) goldenBuildTimer = setInterval(loadGoldenBuildStatus, 10000);
+    // 1s countdown re-render (text only) while a session is active.
+    if (!goldenBuildCountdown) goldenBuildCountdown = setInterval(() => {
+      if (state.goldenBuild) renderGoldenBuildBanner();
+    }, 1000);
     // Polling fallback: only fetch when the live channel is down; pool usage
     // (no WS message for it) still refreshes on a slow multiple of the tick.
     let tickCount = 0;
