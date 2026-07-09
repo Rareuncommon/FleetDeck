@@ -184,10 +184,76 @@ function deleteSafetySnapshotRecord(db, id) {
   db.prepare('DELETE FROM safety_snapshots WHERE id = ?').run(id);
 }
 
+// --- Golden Build Mode sessions -------------------------------------------
+// Invariant: at most one row with ended_at IS NULL, ever. Enforced here (not
+// by a DB constraint) so the same query can drive the UI's disabled state.
+
+function getActiveGoldenBuildSession(db) {
+  return db.prepare(
+    'SELECT * FROM golden_build_sessions WHERE ended_at IS NULL ORDER BY id DESC LIMIT 1'
+  ).get() || null;
+}
+
+// Atomic check-then-insert. better-sqlite3 is synchronous, so wrapping the
+// "is one already active?" check and the insert in a single transaction means
+// two concurrent arm requests cannot both observe "none active" and both
+// insert — the single-active invariant holds without a DB constraint. Throws
+// an error tagged GOLDEN_BUILD_ACTIVE if one is already active (the caller
+// has already produced a friendlier message from its own pre-check, but this
+// is the real race guard).
+function insertGoldenBuildSession(db, { mac, startedAt, expiresAt }) {
+  const tx = db.transaction(() => {
+    const active = db.prepare(
+      'SELECT id FROM golden_build_sessions WHERE ended_at IS NULL'
+    ).get();
+    if (active) {
+      const err = new Error('An active golden build session already exists');
+      err.code = 'GOLDEN_BUILD_ACTIVE';
+      throw err;
+    }
+    const info = db.prepare(
+      'INSERT INTO golden_build_sessions (mac, started_at, expires_at) VALUES (?, ?, ?)'
+    ).run(mac, startedAt, expiresAt);
+    return db.prepare('SELECT * FROM golden_build_sessions WHERE id = ?').get(info.lastInsertRowid);
+  });
+  return tx();
+}
+
+// Ends the current active session (if any). Idempotent: returns null and does
+// nothing when none is active, so double-ending is a harmless no-op.
+function closeActiveGoldenBuildSession(db, reason) {
+  const active = getActiveGoldenBuildSession(db);
+  if (!active) return null;
+  const endedAt = new Date().toISOString();
+  db.prepare(
+    'UPDATE golden_build_sessions SET ended_at = ?, ended_reason = ? WHERE id = ?'
+  ).run(endedAt, reason, active.id);
+  return { ...active, ended_at: endedAt, ended_reason: reason };
+}
+
+// Closes any active session whose expires_at has passed (reason 'expired').
+// Returns the rows that were closed so the caller can log them.
+function closeExpiredGoldenBuildSessions(db, nowIso) {
+  const expired = db.prepare(
+    'SELECT * FROM golden_build_sessions WHERE ended_at IS NULL AND expires_at <= ?'
+  ).all(nowIso);
+  if (expired.length === 0) return [];
+  const endedAt = new Date().toISOString();
+  const upd = db.prepare(
+    'UPDATE golden_build_sessions SET ended_at = ?, ended_reason = ? WHERE id = ?'
+  );
+  db.transaction(() => {
+    for (const s of expired) upd.run(endedAt, 'expired', s.id);
+  })();
+  return expired.map((s) => ({ ...s, ended_at: endedAt, ended_reason: 'expired' }));
+}
+
 module.exports = {
   initDb, listClients, getClient, getClientByMac, insertClient, updateClient, deleteClient,
   getSetting, setSetting, getAllSettings, logEvent, listEvents, pruneEvents,
   upsertDiscovered, listDiscovered, removeDiscovered,
   insertSafetySnapshot, listExpiredSafetySnapshots, deleteSafetySnapshotRecord,
+  getActiveGoldenBuildSession, insertGoldenBuildSession,
+  closeActiveGoldenBuildSession, closeExpiredGoldenBuildSessions,
   changes,
 };

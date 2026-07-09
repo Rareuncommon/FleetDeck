@@ -46,3 +46,20 @@ CREATE TABLE IF NOT EXISTS safety_snapshots (
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   FOREIGN KEY (client_id) REFERENCES clients(id)
 );
+
+-- Golden Build Mode sessions: a MAC armed here boots directly into the live
+-- win-golden zvol (sanhook, no clone), so anything it writes lands on the
+-- golden image permanently. Only ONE row may have ended_at IS NULL at a time
+-- across the whole table; that invariant is enforced in the application layer
+-- (see db/index.js insertGoldenBuildSession) rather than by a DB constraint,
+-- because the same "is one already active?" query also drives the UI's
+-- disabled state. ended_reason is 'expired' | 'manual' | NULL while active.
+CREATE TABLE IF NOT EXISTS golden_build_sessions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  mac TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  ended_at TEXT,
+  ended_reason TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_golden_build_sessions_active ON golden_build_sessions(mac, ended_at);

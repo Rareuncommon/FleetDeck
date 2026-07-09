@@ -41,6 +41,31 @@ function renderBootScript({ client, settings, truenasHost }) {
   return defaultScript(tokens);
 }
 
+// The golden iSCSI target name is the last path segment of GOLDEN_ZVOL
+// (Main_pool/iscsi/win-golden -> win-golden). Resolved from config rather
+// than hardcoded so overriding GOLDEN_ZVOL keeps the boot script and the
+// golden-target session check (services/goldenBuild.js) in agreement.
+function goldenTargetName(goldenZvol) {
+  return String(goldenZvol || '').split('/').pop();
+}
+
+// Golden Build Mode boot script. Unlike renderBootScript (sanboot into a
+// per-client clone), this sanhooks the machine directly onto the live golden
+// zvol as a local disk and chains into WinPE to service it in place — so
+// anything written lands permanently on the golden image. `keep-san 1` keeps
+// the iSCSI connection alive across the chain so WinPE sees drive 0x80.
+// Host / IQN-prefix / golden-target resolution match renderBootScript's.
+function renderGoldenBuildScript({ settings, truenasHost, goldenZvol, winpeChainUrl }) {
+  const iqnPrefix = resolveIqnPrefix(settings);
+  const target = goldenTargetName(goldenZvol);
+  return [
+    '#!ipxe',
+    'set keep-san 1',
+    `sanhook --drive 0x80 iscsi:${truenasHost}::::${iqnPrefix}:${target}`,
+    `chain ${winpeChainUrl}`,
+  ].join('\n') + '\n';
+}
+
 function renderUnknownScript(mac) {
   return [
     '#!ipxe',
@@ -51,4 +76,7 @@ function renderUnknownScript(mac) {
   ].join('\n') + '\n';
 }
 
-module.exports = { renderBootScript, renderUnknownScript, DEFAULT_IQN_PREFIX };
+module.exports = {
+  renderBootScript, renderUnknownScript, renderGoldenBuildScript,
+  goldenTargetName, DEFAULT_IQN_PREFIX,
+};

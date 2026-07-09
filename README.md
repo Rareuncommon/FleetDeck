@@ -8,6 +8,7 @@ FleetDeck is a single-container web app that manages a diskless Windows gaming f
 - **One-click client lifecycle** — create, reset, rebase, retire, and promote-golden, each a single action against TrueNAS.
 - **Bulk reset + nightly cron** — reset the whole fleet at once, or on a schedule (`node-cron`) for a clean image every morning.
 - **iPXE script serving** — serves per-client boot scripts at `/boot/<mac-hexhyp>.ipxe`, with an unknown-MAC discovery/adopt flow so new machines show up in the dashboard ready to be provisioned.
+- **Golden Build Mode** — arm a machine to boot directly into the live golden image (`sanhook`, not a clone) to service it in place, replacing hand-editing override files on the `ipxeboot` container. Deliberately distinct from Adopt: one session at a time, time-limited with auto-expiry, refuses if TrueNAS already has a session on the golden target, audited throughout. See [docs/DEPLOY.md](docs/DEPLOY.md).
 - **DRY_RUN safety** — introspect TrueNAS read-only before letting FleetDeck mutate anything.
 - **Auto safety-snapshot** — every reset/rebase/retire quarantine-clones the client's pre-wipe zvol before touching it, giving a brief undo window (purged automatically after a retention period).
 - **Wake-on-LAN** — optionally sends a magic packet after a successful reset/rebase, so a nightly wipe leaves the machine booted and ready by morning (opt-in; requires WoL enabled on each client's NIC/firmware).

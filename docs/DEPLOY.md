@@ -41,7 +41,7 @@ Set these in the app's environment config:
 | `CLIENT_ZVOL_ROOT` | e.g. `Main_pool/iscsi`. |
 | `POOL_NAME` | Pool name for capacity alerting, e.g. `Main_pool`. Defaults to `CLIENT_ZVOL_ROOT`'s first segment. |
 
-A few more tunables (`wol_enabled`, `wol_broadcast`, `pool_alert_threshold_pct`, `safety_snapshot_retention_days`, `nightly_reset_cron`) live in the in-app Settings panel, not as env vars — they take effect immediately without a restart.
+A few more tunables (`wol_enabled`, `wol_broadcast`, `pool_alert_threshold_pct`, `safety_snapshot_retention_days`, `nightly_reset_cron`, `winpe_chain_url`, `golden_build_default_minutes`) live in the in-app Settings panel, not as env vars — they take effect immediately without a restart. See "Rebuilding the golden image (Golden Build Mode)" below for the last two.
 
 **Wake-on-LAN and container networking**
 
@@ -142,3 +142,44 @@ Only after one client is validated end-to-end should you consider the migration 
 - Keep the old nginx boot server (`192.168.1.246`) running **read-only** until the migration is validated across the whole fleet.
 - Reverting is simply re-flashing the **old** `snponly.efi` (the one that chains to `192.168.1.246`). Keep a copy of it before you overwrite anything.
 - Because the old server is untouched and still serving, rollback is just swapping the binary back — no data migration, no TrueNAS changes.
+
+---
+
+## 5. Rebuilding the golden image (Golden Build Mode)
+
+Golden Build Mode is FleetDeck's replacement for the old manual process of hand-dropping a static per-MAC `.ipxe` override file into the separate `ipxeboot` container's `http/boot/` directory every time you needed to service the golden image. FleetDeck now serves that boot script dynamically, gated by an audited, time-limited, one-at-a-time session.
+
+**What it does — and why it's dangerous.** Arming a MAC makes FleetDeck serve it a boot script that `sanhook`s it **directly onto the live `win-golden` zvol** (no clone) and chains into WinPE. Anything that machine writes lands permanently on the golden image that *every* future client is cloned from. This is fundamentally different from **Adopt**, which clones golden into a new per-client zvol and joins the managed fleet. The two are deliberately separate actions in the UI (Adopt is teal; "Boot into Golden Build Mode" is amber with an explicit confirmation modal).
+
+**Settings (in-app Settings tab, not env vars):**
+
+| Setting | Purpose |
+|---------|---------|
+| `winpe_chain_url` | URL of the WinPE chain script hosted on the separate `ipxeboot` container, e.g. `http://192.168.1.246/boot/winpe.ipxe`. **Must be set** before Golden Build Mode can be armed — arming returns a clear error if it's empty. |
+| `golden_build_default_minutes` | Default session duration when the arm request doesn't specify one (default `240`). |
+
+**The served script** (for the armed MAC only):
+
+```
+#!ipxe
+set keep-san 1
+sanhook --drive 0x80 iscsi:<TRUENAS_HOST>::::<IQN_PREFIX>:<golden target>
+chain <winpe_chain_url>
+```
+
+`<golden target>` is the last path segment of `GOLDEN_ZVOL` (e.g. `win-golden`); host and IQN prefix come from config/settings, same as normal client boot scripts.
+
+**Flow:**
+
+1. In Settings, set `winpe_chain_url`.
+2. On the Dashboard, in **Discovered clients**, click **Boot into Golden Build Mode** on the target machine's MAC and confirm the modal. (Arming performs no TrueNAS mutation — it only changes what FleetDeck serves next. It is intentionally **not** gated by `DRY_RUN`; see the note below.)
+3. PXE-boot that machine. It sanhooks onto `win-golden`, boots WinPE, and you service the image in place.
+4. When done, click **End session** in the amber banner on the **Golden** tab (or let it auto-expire). Then promote a new `gold-vN` from the Golden tab as usual.
+
+**Guardrails:**
+
+- **One session at a time.** Two machines `sanhook`-ing the same LUN concurrently can corrupt the golden filesystem, so FleetDeck refuses to arm a second machine while one is active, and additionally refuses to arm if TrueNAS already reports a live iSCSI session on the golden target.
+- **Auto-expiry** closes the session after its duration so a forgotten session doesn't leave golden writable indefinitely. **Note:** expiry (and manual End) only stop the script from being served on a *future* PXE attempt — neither can forcibly disconnect a machine that is already connected. Reboot the machine or disconnect it in TrueNAS to end a live connection.
+- **`DRY_RUN` does not protect golden here.** `DRY_RUN=1` gates FleetDeck-initiated TrueNAS mutations (clone/create/delete); it does not gate boot-script serving, and Golden Build Mode is a serving change. An armed machine can therefore write to golden even under `DRY_RUN=1`. The real safety mechanisms are the single-session invariant, the golden-target session check, and the confirmation modal — not `DRY_RUN`.
+
+**Fallback.** The old manual method (a static per-MAC `.ipxe` file dropped into the `ipxeboot` server's `http/boot/`) still works if you ever need it, but it is no longer the documented primary path.

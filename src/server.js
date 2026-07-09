@@ -18,6 +18,7 @@ const { createBootRouter } = require('./routes/boot');
 const { createPoolRouter } = require('./routes/pool');
 const { createReconcileRouter } = require('./routes/reconcile');
 const { createBulkImportRouter } = require('./routes/bulkImport');
+const { createGoldenBuildRouter } = require('./routes/goldenBuild');
 const { createTrueNasStatusRouter } = require('./routes/truenas');
 const { startSessionPoller } = require('./services/sessionPoller');
 const { startScheduler } = require('./services/scheduler');
@@ -173,6 +174,7 @@ async function main() {
   app.use(createPoolRouter(ctx));
   app.use(createReconcileRouter(ctx));
   app.use(createBulkImportRouter(ctx));
+  app.use(createGoldenBuildRouter(ctx));
   app.use(createTrueNasStatusRouter(ctx));
 
   app.get('/api/events', (req, res) => {
