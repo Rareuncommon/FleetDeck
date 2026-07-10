@@ -990,6 +990,97 @@ $("#reconcile").addEventListener("click", async (e) => {
   }
 });
 
+/* ============================= Setup tab ================================ */
+
+function bfBadge(entry) {
+  return entry && entry.present
+    ? `<span class="tag toggle-on">present</span>`
+    : `<span class="tag" style="color:var(--red);border-color:var(--red)">missing</span>`;
+}
+
+function bfSize(entry) {
+  return entry && entry.present ? fmtBytes(entry.size) : "—";
+}
+
+async function loadSetup() {
+  let s = null;
+  try { s = await api("GET", "/api/bootfiles/status"); } catch (e) { return; }
+
+  const install = s.install || {};
+  const installLabel = install.kind === "swm"
+    ? `install.swm split media (${install.swmParts} parts)`
+    : install.kind ? `install.${install.kind}` : null;
+  const rows = [
+    ["snponly.efi", `TFTP (udp/${s.tftp.port}${s.tftp.enabled ? "" : ", disabled"}) — what DHCP points firmware at`, s.tftp.snponly],
+    ["wimboot", "chains WinPE over HTTP", s.http.wimboot],
+    ["media/Boot/BCD", "WinPE boot configuration", s.http.bcd],
+    ["media/Boot/boot.sdi", "WinPE RAM-disk", s.http.bootSdi],
+    ["media/sources/boot.wim", "WinPE image", s.http.bootWim],
+    [installLabel || "media/sources/install.wim|esd|swm", "Windows install image", install.kind ? { present: true, size: null } : { present: false }],
+  ];
+  $("#bootfiles-body").innerHTML = rows.map(([name, purpose, entry]) => `
+    <tr><td class="mono">${esc(name)}</td><td class="muted">${esc(purpose)}</td>
+    <td>${bfBadge(entry)}</td><td>${entry && entry.size != null ? esc(bfSize(entry)) : "—"}</td></tr>`).join("");
+
+  // Split-WIM media changes how the golden image must be applied (Windows
+  // Setup silently can't install from .swm) — surface it loudly here since
+  // it drives the generated deploy script.
+  const note = $("#bf-media-note");
+  if (install.kind === "swm") {
+    note.innerHTML = `⚠️ <span style="color:var(--amber)">Split .swm media detected (${install.swmParts} parts).</span> Windows Setup cannot install from split images — the generated deploy script will use <span class="mono">dism /Apply-Image /SWMFile:</span> automatically.`;
+  } else if (install.kind) {
+    note.textContent = `Single ${installLabel} detected — the deploy script will use dism /Apply-Image directly.`;
+  } else {
+    note.textContent = "No install image staged yet. Copy the Windows ISO contents into media/ (use the SMB share button, then copy from any machine on the LAN).";
+  }
+  if (s.smb && !s.smb.supported) $("#bf-smb-share").title = "Not supported by this TrueNAS build — create the share in the TrueNAS UI";
+
+  // Live "did DHCP work" indicators: amber pulse while waiting, green once a
+  // real request has arrived. FleetDeck detects these itself — the honest
+  // confirmation that the manual DHCP step was done right.
+  const act = s.activity || {};
+  const ind = (label, a) => {
+    const seen = a && a.first;
+    return `<div class="tile" style="min-width:220px${seen ? "" : ";border-color:var(--amber)"}">
+      <div class="n" style="font-size:13px;color:${seen ? "var(--green)" : "var(--amber)"}">
+        ${seen ? "✓ " + esc(label) + " request seen" : "… waiting for first " + esc(label) + " request"}</div>
+      <div class="l">${seen ? "first " + esc(fmtTime(a.first)) + " · last " + esc(fmtTime(a.last)) : "no " + esc(label) + " boot traffic yet"}</div>
+    </div>`;
+  };
+  $("#boot-activity").innerHTML = ind("TFTP", act.tftp) + ind("HTTP /boot", act.http);
+}
+
+$("#bf-refresh").addEventListener("click", loadSetup);
+
+$("#bf-download-wimboot").addEventListener("click", async () => {
+  const btn = $("#bf-download-wimboot");
+  btn.disabled = true;
+  try {
+    const r = await api("POST", "/api/bootfiles/download-wimboot");
+    toast(`wimboot downloaded (${fmtBytes(r.size)})`);
+    loadSetup();
+  } catch (err) { toast(err.message, "err"); }
+  btn.disabled = false;
+});
+
+$("#bf-smb-share").addEventListener("click", async () => {
+  try {
+    const r = await api("POST", "/api/bootfiles/smb-share");
+    if (r.dryRun) {
+      await openModal({
+        title: "DRY_RUN: share not created",
+        bodyHTML: `<p>DRY_RUN=1 — this is the exact sharing.smb.create payload that would run:</p><pre>${esc(JSON.stringify(r.payload, null, 2))}</pre>`,
+        confirmText: "OK", cancelText: "Close",
+      });
+    } else if (r.existing) {
+      toast(`SMB share "${r.share.name}" already exists`);
+    } else {
+      toast("SMB share created — copy the ISO contents into its media/ folder");
+    }
+    loadSetup();
+  } catch (err) { toast(err.message, "err"); }
+});
+
 /* ============================ Settings tab ============================== */
 
 // Seed defaults for keys the backend reads via getSetting(db,key,default) so
@@ -1004,10 +1095,16 @@ const SETTINGS_DEFAULTS = {
   wol_broadcast: "255.255.255.255",
   pool_alert_threshold_pct: "85",
   safety_snapshot_retention_days: "3",
-  // Golden Build Mode: the WinPE chain script served on the separate ipxeboot
-  // container. Must be set before Golden Build Mode can be armed.
+  // Golden Build Mode: the WinPE chain script. FleetDeck now generates and
+  // serves one itself at /boot/files/winpe.ipxe — point this at
+  // http://<this-host>:<port>/boot/files/winpe.ipxe (an external URL still
+  // works if you keep WinPE elsewhere). Must be set before arming.
   winpe_chain_url: "",
   golden_build_default_minutes: "240",
+  // TrueNAS-side path of the dataset mounted at /data (e.g.
+  // /mnt/Main_pool/apps/fleetdeck) — needed to create the SMB staging share.
+  bootfiles_host_path: "",
+  bootfiles_smb_share_name: "fleetdeck-bootfiles",
 };
 async function loadSettings() {
   let s = {};
@@ -1078,6 +1175,7 @@ function paletteItems() {
     { kind: "nav", label: "Go to Dashboard", run: () => switchView("dashboard") },
     { kind: "nav", label: "Go to Golden", run: () => switchView("golden") },
     { kind: "nav", label: "Go to Reconcile", run: () => switchView("reconcile") },
+    { kind: "nav", label: "Go to Setup", run: () => switchView("setup") },
     { kind: "nav", label: "Go to Settings", run: () => switchView("settings") },
     { kind: "nav", label: "Go to Audit", run: () => switchView("events") },
   ];
@@ -1160,6 +1258,7 @@ function switchView(v) {
   $("#sidebar").classList.remove("open");
   if (v === "golden") loadGolden();
   else if (v === "reconcile") loadReconcile();
+  else if (v === "setup") loadSetup();
   else if (v === "settings") loadSettings();
   else if (v === "events") loadEvents();
 }
@@ -1222,6 +1321,9 @@ async function boot() {
     // (no WS message for it) still refreshes on a slow multiple of the tick.
     let tickCount = 0;
     if (!pollTimer) pollTimer = setInterval(() => {
+      // Setup tab hosts the live boot-request indicator — poll it so the
+      // "waiting for first boot" tile flips green without a manual refresh.
+      if ($("#setup").classList.contains("active")) { loadSetup(); return; }
       if (!$("#dashboard").classList.contains("active")) return;
       tickCount += 1;
       if (!state.wsConnected) { loadClients(); loadDiscovered(); }

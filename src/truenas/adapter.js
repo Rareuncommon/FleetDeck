@@ -19,17 +19,41 @@ const CANDIDATES = {
   targetExtentCreate: ['iscsi.targetextent.create'],
   targetExtentDelete: ['iscsi.targetextent.delete'],
   sessionsList:       ['iscsi.global.sessions', 'iscsi.global.session_list', 'iscsi.global.client_count'],
+  // --- Setup-wizard capabilities (all OPTIONAL, see OPTIONAL_CAPABILITIES):
+  // used to create the golden zvol / datasets, enable iSCSI, and build the
+  // portal → initiator → target chain from the UI. Verified against the
+  // v25.10 schema pages like the core set above.
+  datasetCreate:      ['pool.dataset.create'],
+  serviceQuery:       ['service.query'],
+  serviceUpdate:      ['service.update'],
+  serviceStart:       ['service.control', 'service.start'],
+  portalQuery:        ['iscsi.portal.query'],
+  portalCreate:       ['iscsi.portal.create'],
+  initiatorQuery:     ['iscsi.initiator.query'],
+  initiatorCreate:    ['iscsi.initiator.create'],
+  smbShareQuery:      ['sharing.smb.query'],
+  smbShareCreate:     ['sharing.smb.create'],
 };
+
+// Capabilities that resolve to null (instead of failing introspection) when
+// the TrueNAS build doesn't expose them. Consumers must check supports() and
+// degrade to "do this in the TrueNAS UI" instructions — never a button that
+// errors. The original 16 core capabilities stay hard requirements.
+const OPTIONAL_CAPABILITIES = new Set([
+  'datasetCreate', 'serviceQuery', 'serviceUpdate', 'serviceStart',
+  'portalQuery', 'portalCreate', 'initiatorQuery', 'initiatorCreate',
+  'smbShareQuery', 'smbShareCreate',
+]);
 
 // Payload shapes below were checked against https://api.truenas.com/v25.10/
 // (the api_methods_*.html pages). Note on jobs: that documentation marks
 // long-running job methods explicitly ("This method is a job.", e.g.
-// pool.scrub.scrub); none of the methods used here — including
+// pool.scrub.scrub); none of the CORE methods used here — including
 // pool.dataset.delete and pool.snapshot.clone — carry that marker in 25.10,
-// so every call() resolves with the final result and no core.job_wait
-// handling is needed. If a future TrueNAS release turns any of these into a
-// job, call() will start resolving with a job id instead of the result and a
-// job-wait helper will be required on TrueNASClient.
+// so their call()s resolve with the final result directly. The one exception
+// among the optional setup capabilities is service.control, which IS a job
+// in 25.10 and goes through client.callJob (which polls core.get_jobs — see
+// client.js for why core.job_wait can't be used).
 
 class TrueNASAdapter {
   constructor(client) {
@@ -44,7 +68,7 @@ class TrueNASAdapter {
   }
 
   async introspect() {
-    this.methods = await resolveMethods(this.client, CANDIDATES);
+    this.methods = await resolveMethods(this.client, CANDIDATES, OPTIONAL_CAPABILITIES);
     this.sessionsGranular = this.methods.sessionsList !== 'iscsi.global.client_count';
     if (!this.sessionsGranular) {
       console.error(
@@ -60,6 +84,21 @@ class TrueNASAdapter {
   _requireIntrospected() {
     if (!this.methods) {
       throw new Error('TrueNASAdapter.introspect() must be called before using adapter methods.');
+    }
+  }
+
+  // Does this TrueNAS build expose an (optional) capability? UI code checks
+  // this to render honest "not supported — do it in the TrueNAS UI" steps.
+  supports(capability) {
+    return !!(this.methods && this.methods[capability]);
+  }
+
+  _requireCapability(capability) {
+    this._requireIntrospected();
+    if (!this.methods[capability]) {
+      throw new Error(
+        `This TrueNAS build does not expose a method for "${capability}"; perform this step in the TrueNAS UI instead.`
+      );
     }
   }
 
@@ -245,6 +284,85 @@ class TrueNASAdapter {
     if (Array.isArray(raw)) return raw.length;
     return raw == null ? 0 : 1;
   }
+
+  // --- Setup-wizard capabilities (all OPTIONAL — callers check supports()
+  // and render "do this in the TrueNAS UI" guidance when unsupported) ------
+
+  // Verified against the v25.10 schema (pool.dataset.create): one object
+  // param; the Volume variant takes { name, type: 'VOLUME', volsize,
+  // sparse, volblocksize }, the Filesystem variant { name } (+ options).
+  // Callers pass the full payload since the wizard also displays it verbatim
+  // as the would-be RPC in dry-run.
+  async createDataset(payload) {
+    this._requireCapability('datasetCreate');
+    return this.client.call(this.methods.datasetCreate, [payload]);
+  }
+
+  async queryServices(filters = []) {
+    this._requireCapability('serviceQuery');
+    return this.client.call(this.methods.serviceQuery, [filters]);
+  }
+
+  // Verified against the v25.10 schema (service.update): [id_or_name,
+  // { enable }] — `enable` is only the start-on-boot flag; the running state
+  // is startService's business.
+  async setServiceEnabled(idOrName, enable) {
+    this._requireCapability('serviceUpdate');
+    return this.client.call(this.methods.serviceUpdate, [idOrName, { enable }]);
+  }
+
+  async startService(name) {
+    this._requireCapability('serviceStart');
+    if (this.methods.serviceStart === 'service.control') {
+      // Verified against the v25.10 schema (service.control): [verb, service,
+      // options], and it IS a job — the one job method FleetDeck calls, hence
+      // callJob (see client.js). silent:false makes a failed start raise
+      // instead of quietly resolving false.
+      return this.client.callJob(this.methods.serviceStart, ['START', name, { silent: false }]);
+    }
+    // Legacy pre-25.10 service.start: [service, options], plain call.
+    return this.client.call(this.methods.serviceStart, [name, { silent: false }]);
+  }
+
+  async queryPortals(filters = []) {
+    this._requireCapability('portalQuery');
+    return this.client.call(this.methods.portalQuery, [filters]);
+  }
+
+  // Verified against the v25.10 schema (iscsi.portal.create): { listen:
+  // [{ ip }], comment } — note there is NO port field in 25.10; portals
+  // always listen on 3260. ip '0.0.0.0' listens on all interfaces.
+  async createPortal({ listen, comment = '' }) {
+    this._requireCapability('portalCreate');
+    return this.client.call(this.methods.portalCreate, [{ listen, comment }]);
+  }
+
+  async queryInitiators(filters = []) {
+    this._requireCapability('initiatorQuery');
+    return this.client.call(this.methods.initiatorQuery, [filters]);
+  }
+
+  // Verified against the v25.10 schema (iscsi.initiator.create):
+  // { initiators: [], comment } — an EMPTY initiators array means
+  // "allow all initiators", which is what the wizard creates.
+  async createInitiator({ initiators = [], comment = '' }) {
+    this._requireCapability('initiatorCreate');
+    return this.client.call(this.methods.initiatorCreate, [{ initiators, comment }]);
+  }
+
+  async querySmbShares(filters = []) {
+    this._requireCapability('smbShareQuery');
+    return this.client.call(this.methods.smbShareQuery, [filters]);
+  }
+
+  // Verified against the v25.10 schema (sharing.smb.create): { path, name,
+  // purpose, comment, ... } with purpose defaulting to DEFAULT_SHARE (the
+  // recommended mode). Full payload passed through for the same dry-run
+  // display reason as createDataset.
+  async createSmbShare(payload) {
+    this._requireCapability('smbShareCreate');
+    return this.client.call(this.methods.smbShareCreate, [payload]);
+  }
 }
 
-module.exports = { TrueNASAdapter, CANDIDATES };
+module.exports = { TrueNASAdapter, CANDIDATES, OPTIONAL_CAPABILITIES };

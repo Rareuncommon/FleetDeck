@@ -1,5 +1,7 @@
 'use strict';
 
+const path = require('path');
+
 function truthyFlag(v, defaultValue) {
   if (v === undefined || v === '') return defaultValue;
   return v === '1' || v.toLowerCase() === 'true';
@@ -43,6 +45,18 @@ function loadConfig(env = process.env) {
     // Root pool dataset (e.g. "Main_pool") for pool-capacity alerting — defaults
     // to CLIENT_ZVOL_ROOT's first path segment, override if it ever differs.
     poolName: env.POOL_NAME || (env.CLIENT_ZVOL_ROOT || 'Main_pool/iscsi').split('/')[0],
+    // Boot-chain file storage (wimboot, WinPE media, snponly.efi). Defaults to
+    // a sibling of the SQLite file so the one persistent /data volume the
+    // deployment already mounts covers it — one process writing and reading
+    // its own files is the whole point (it kills the o+r permission bugs the
+    // separate nginx container kept hitting).
+    bootfilesDir: env.BOOTFILES_DIR
+      || path.join(path.dirname(env.DB_PATH || './data/fleetdeck.sqlite3'), 'bootfiles'),
+    // In-process TFTP for snponly.efi. Optional so an external TFTP server
+    // remains possible; port overridable mainly for tests (69 needs root or
+    // host networking — the deployment already uses host networking).
+    tftpEnabled: truthyFlag(env.TFTP_ENABLED, true),
+    tftpPort: Number(env.TFTP_PORT) || 69,
   };
 }
 

@@ -18,6 +18,16 @@ In the TrueNAS SCALE UI: **Apps > Discover Apps > Custom App** (labeled "Launch 
 - FleetDeck serves the UI, API, live-update WebSocket (`/ws`), and `/boot/*` all on this one port.
 - Because `/boot/*` is unauthenticated (firmware can't log in), keep this on the LAN only.
 
+**Boot-file serving — the ipxeboot container is retired**
+
+FleetDeck now serves the entire boot chain itself, replacing the separate nginx+dnsmasq `ipxeboot` container:
+
+- **HTTP**: `wimboot` and the WinPE media are served (with Range support — wimboot fetches ranged) at `/boot/files/*`, backed by `<BOOTFILES_DIR>/http/`. `winpe.ipxe` is **generated** at `/boot/files/winpe.ipxe` from what's actually on disk — including real filename case, which kills the `bcd` vs `BCD` class of bug — so there is no hand-edited script to drift.
+- **TFTP**: an in-process, read-only TFTP server hands out `snponly.efi` from `<BOOTFILES_DIR>/tftp/` on udp/69. This requires **host networking** (the deployment already uses it) and root in the container; if the bind fails, FleetDeck logs a warning and keeps running, and `TFTP_ENABLED=0` opts out entirely if you prefer an external TFTP server.
+- Because one process writes and serves these files on its own volume, the recurring 403s from copied-in files lacking `o+r` on the old container are structurally gone.
+
+**Migration**: stop and remove the old `ipxeboot` container after copying `snponly.efi` into `<BOOTFILES_DIR>/tftp/` and any staged media into `<BOOTFILES_DIR>/http/media/`. Your DHCP/UniFi network-boot settings don't change as long as FleetDeck runs on the same host IP the DHCP boot server already points at (filename stays `snponly.efi`). The **Setup tab** shows presence/size of every required file and a live "first boot request seen" indicator that confirms the DHCP settings actually work.
+
 **Frontend and live updates**
 
 - The web UI is plain static files (`index.html`, `app.css`, `app.js`) — there is **no build step**, so deployment is unchanged: build the image, run it. Nothing to compile.
@@ -40,6 +50,9 @@ Set these in the app's environment config:
 | `GOLDEN_ZVOL` | e.g. `Main_pool/iscsi/win-golden`. |
 | `CLIENT_ZVOL_ROOT` | e.g. `Main_pool/iscsi`. |
 | `POOL_NAME` | Pool name for capacity alerting, e.g. `Main_pool`. Defaults to `CLIENT_ZVOL_ROOT`'s first segment. |
+| `BOOTFILES_DIR` | Boot-chain file storage (wimboot, WinPE media, snponly.efi). Defaults to `<dir of DB_PATH>/bootfiles`, i.e. on the same persistent `/data` volume. |
+| `TFTP_ENABLED` | `1` (default) = FleetDeck serves TFTP itself for `snponly.efi`. Set `0` to keep an external TFTP server. |
+| `TFTP_PORT` | TFTP port, default `69`. Port 69 requires host networking + root in the container. |
 
 A few more tunables (`wol_enabled`, `wol_broadcast`, `pool_alert_threshold_pct`, `safety_snapshot_retention_days`, `nightly_reset_cron`, `winpe_chain_url`, `golden_build_default_minutes`) live in the in-app Settings panel, not as env vars — they take effect immediately without a restart. See "Rebuilding the golden image (Golden Build Mode)" below for the last two.
 
@@ -155,7 +168,7 @@ Golden Build Mode is FleetDeck's replacement for the old manual process of hand-
 
 | Setting | Purpose |
 |---------|---------|
-| `winpe_chain_url` | URL of the WinPE chain script hosted on the separate `ipxeboot` container, e.g. `http://192.168.1.246/boot/winpe.ipxe`. **Must be set** before Golden Build Mode can be armed — arming returns a clear error if it's empty. |
+| `winpe_chain_url` | URL of the WinPE chain script. FleetDeck now generates and serves one itself — point this at `http://<fleetdeck-host>:<port>/boot/files/winpe.ipxe` (an external URL still works if you host WinPE elsewhere). **Must be set** before Golden Build Mode can be armed — arming returns a clear error if it's empty. |
 | `golden_build_default_minutes` | Default session duration when the arm request doesn't specify one (default `240`). |
 
 **The served script** (for the armed MAC only):

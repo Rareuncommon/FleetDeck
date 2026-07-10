@@ -113,6 +113,36 @@ class TrueNASClient extends EventEmitter {
     });
   }
 
+  // For the (rare) TrueNAS methods that are jobs — as of 25.10 the only one
+  // FleetDeck uses is service.control. Calling a job method over JSON-RPC
+  // resolves immediately with a numeric job id, not the result. core.job_wait
+  // can't be used to wait for it because in 25.10 core.job_wait is *itself* a
+  // job (it would return another job id — chicken and egg). Instead we poll
+  // core.get_jobs — a plain query — until the job reaches a terminal state.
+  // If the method turns out not to be a job on this build (non-numeric
+  // response), the response is returned as-is.
+  async callJob(method, params = [], { pollMs = 500, timeoutMs = 120000 } = {}) {
+    const res = await this.call(method, params);
+    if (typeof res !== 'number') return res;
+    const jobId = res;
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const rows = await this.call('core.get_jobs', [[['id', '=', jobId]]]);
+      const job = Array.isArray(rows) ? rows[0] : null;
+      if (job) {
+        if (job.state === 'SUCCESS') return job.result;
+        if (job.state === 'FAILED' || job.state === 'ABORTED') {
+          const detail = (job.error || (job.exc_info && job.exc_info.repr) || 'no error detail');
+          throw new Error(`TrueNAS job "${method}" (#${jobId}) ${job.state}: ${detail}`);
+        }
+      }
+      if (Date.now() > deadline) {
+        throw new Error(`TrueNAS job "${method}" (#${jobId}) still running after ${timeoutMs}ms`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, pollMs));
+    }
+  }
+
   close() {
     return new Promise((resolve) => {
       this._closed = true;
