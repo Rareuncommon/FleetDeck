@@ -20,6 +20,7 @@ const { createReconcileRouter } = require('./routes/reconcile');
 const { createBulkImportRouter } = require('./routes/bulkImport');
 const { createGoldenBuildRouter } = require('./routes/goldenBuild');
 const { createBootFilesRouter } = require('./routes/bootFiles');
+const { createSetupRouter } = require('./routes/setup');
 const { ensureBootDirs, recordBootActivity } = require('./services/bootFiles');
 const { startTftpServer } = require('./services/tftp');
 const { createTrueNasStatusRouter } = require('./routes/truenas');
@@ -193,6 +194,7 @@ async function main() {
   app.use(createReconcileRouter(ctx));
   app.use(createBulkImportRouter(ctx));
   app.use(createGoldenBuildRouter(ctx));
+  app.use(createSetupRouter(ctx));
   app.use(createTrueNasStatusRouter(ctx));
 
   app.get('/api/events', (req, res) => {
@@ -257,6 +259,7 @@ async function main() {
         port: config.tftpPort,
         onRead: (filename) => recordBootActivity(db, 'tftp', filename),
       });
+      ctx.tftp = tftp; // diagnostics self-test reads through the live server
       console.log(`[server] TFTP serving ${bootDirs.tftp} on udp/${tftp.port}`);
     } catch (err) {
       console.error(

@@ -154,6 +154,11 @@
 
     <section id="setup">
       <div class="panel">
+        <h2 style="margin-top:0">TrueNAS setup wizard</h2>
+        <p class="muted" style="margin:0 0 10px">Idempotent and re-runnable: each step shows what already exists vs. what would be created, asks before creating anything, and in DRY_RUN shows the exact RPC payloads instead of executing. Steps this TrueNAS build can't do over the API become instructions, not buttons.</p>
+        <div id="wizard-steps"></div>
+      </div>
+      <div class="panel">
         <h2 style="margin-top:0">Boot chain files</h2>
         <p class="muted" style="margin:0 0 10px">FleetDeck serves every boot-chain asset itself (HTTP at <span class="mono">/boot/files/</span>, TFTP for <span class="mono">snponly.efi</span>) — the separate ipxeboot container is no longer needed.</p>
         <table id="bootfiles-table">
@@ -171,6 +176,13 @@
         <h2 style="margin-top:0">Network boot detection</h2>
         <p class="muted" style="margin:0 0 10px">Point your DHCP server (UniFi: Network &gt; Settings &gt; your LAN &gt; Network Boot) at this host with filename <span class="mono">snponly.efi</span>. FleetDeck can't configure the router, but it can prove the settings work — these flip green on the first real request.</p>
         <div id="boot-activity" class="row"></div>
+      </div>
+      <div class="panel">
+        <h2 style="margin-top:0">Diagnostics</h2>
+        <div class="row">
+          <button id="diag-run" class="accent">Run diagnostics</button>
+        </div>
+        <div id="diag-results" style="margin-top:8px"></div>
       </div>
     </section>
 

@@ -86,7 +86,9 @@ If this dataset doesn't exist, the safety-snapshot step fails closed (logged as 
 
 ## 2. First bring-up procedure
 
-Bring FleetDeck up in read-only mode before it's allowed to touch anything.
+Bring FleetDeck up in read-only mode before it's allowed to touch anything, then drive the whole TrueNAS-side setup from the **Setup tab** instead of clicking through the TrueNAS UI:
+
+The Setup tab's wizard checks and (with one confirmation each) creates: the client + `_safety` datasets, the golden zvol (sparse, 64K blocks, size prompt), iSCSI service enable+start, the portal (0.0.0.0:3260), an allow-all initiator group, the `win-golden` target **with portal groups** (an ungrouped target is unreachable — the wizard flags that exact misconfiguration), the device extent, and the LUN 0 mapping. Every step is idempotent and re-runnable: what already exists is reported, not re-created. With `DRY_RUN=1` each Create button shows the exact would-be RPC payloads and executes nothing — so you can walk the entire wizard in dry-run first and read precisely what it plans to do. Steps this TrueNAS build can't do over the API render as instructions for the TrueNAS UI, never as buttons that error. The manual steps (DHCP network boot, compiling `snponly.efi`) appear as checklist items with exact values prefilled — including a generated docker build command for `snponly.efi` with this instance's chain URL embedded, an upload button for a prebuilt binary, and a live "first boot request seen" indicator that proves the DHCP step worked. A re-runnable **Diagnostics** panel self-tests the whole chain: TrueNAS connection, golden zvol/target-groups, every boot file, a ranged HTTP self-fetch, and a real TFTP self-read.
 
 1. Start the app with **`DRY_RUN=1`**.
 2. Open the dashboard and log in with `ADMIN_PASSWORD`.

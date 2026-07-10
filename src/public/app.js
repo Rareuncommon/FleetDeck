@@ -1050,7 +1050,132 @@ async function loadSetup() {
   $("#boot-activity").innerHTML = ind("TFTP", act.tftp) + ind("HTTP /boot", act.http);
 }
 
-$("#bf-refresh").addEventListener("click", loadSetup);
+/* ---- TrueNAS setup wizard ---- */
+
+function wizardStepRow(step) {
+  const icon = step.supported === false
+    ? '<span class="tag">API n/a</span>'
+    : step.ok
+      ? '<span class="tag toggle-on">✓</span>'
+      : '<span class="tag" style="color:var(--amber);border-color:var(--amber)">todo</span>';
+  let action = "";
+  if (step.kind === "rpc" && !step.ok && step.supported !== false) {
+    action = `<button class="accent" data-wizard-apply="${esc(step.id)}">Create</button>`;
+  } else if (step.id === "snponly") {
+    action = `<button data-wizard-snponly-cmd>Build command</button>
+      <label style="display:inline-block"><input type="file" id="snponly-upload" style="display:none">
+      <button data-wizard-snponly-upload>Upload prebuilt</button></label>`;
+  }
+  return `<div class="row" style="padding:6px 0;border-bottom:1px solid var(--border)">
+    ${icon}
+    <b style="min-width:230px">${esc(step.title)}</b>
+    <span class="muted" style="flex:1">${esc(step.detail || "")}</span>
+    ${action}
+  </div>`;
+}
+
+async function loadWizard() {
+  let s = null;
+  try { s = await api("GET", "/api/setup/status"); } catch (e) { return; }
+  const root = $("#wizard-steps");
+  if (!s.adapterAvailable) {
+    root.innerHTML = '<div class="muted">TrueNAS is unreachable — the wizard needs a live connection for its checks. It will populate once reconnected.</div>'
+      + s.steps.filter((x) => x.kind === "manual").map(wizardStepRow).join("");
+    return;
+  }
+  root.innerHTML = (s.dryRun ? '<div class="muted" style="margin-bottom:6px">DRY_RUN=1 — Create buttons show the exact would-be RPCs and execute nothing.</div>' : "")
+    + s.steps.map(wizardStepRow).join("");
+}
+
+$("#wizard-steps").addEventListener("click", async (e) => {
+  const applyBtn = e.target.closest("[data-wizard-apply]");
+  if (applyBtn) {
+    const stepId = applyBtn.dataset.wizardApply;
+    try {
+      // Fetch the exact plan first so the confirm modal shows real payloads.
+      const preview = await api("POST", `/api/setup/apply/${stepId}`, { planOnly: true });
+      if (preview.already) { toast(preview.detail); loadWizard(); return; }
+      if (preview.supported === false) { toast(preview.detail, "err"); return; }
+      const isGolden = stepId === "golden_zvol";
+      const vals = await openModal({
+        title: `Create: ${stepId}`,
+        confirmText: "Create",
+        bodyHTML: `<p>FleetDeck will run these TrueNAS RPCs, in order:</p>
+          <pre>${esc(JSON.stringify(preview.plan, null, 2))}</pre>
+          ${isGolden ? '<p>Adjust the size below if needed (the plan updates server-side).</p>' : ""}`,
+        fields: isGolden ? [{ name: "sizeGib", label: "Golden zvol size (GiB)", value: "256" }] : null,
+      });
+      if (!vals) return;
+      const body = isGolden ? { sizeGib: parseInt(vals.sizeGib, 10) || 256 } : {};
+      const result = await api("POST", `/api/setup/apply/${stepId}`, body);
+      if (result.dryRun) {
+        await openModal({
+          title: "DRY_RUN: nothing executed",
+          bodyHTML: `<p>These RPCs were logged but not run:</p><pre>${esc(JSON.stringify(result.payloads, null, 2))}</pre>`,
+          confirmText: "OK",
+        });
+      } else if (result.already) {
+        toast(result.detail);
+      } else {
+        toast(`${stepId}: created`);
+      }
+      loadWizard(); loadSetup();
+    } catch (err) { toast(err.message, "err"); }
+    return;
+  }
+
+  if (e.target.closest("[data-wizard-snponly-cmd]")) {
+    try {
+      const b = await api("GET", "/api/setup/snponly-build");
+      await openModal({
+        title: "Build snponly.efi (run on any Docker host)",
+        bodyHTML: `<p>FleetDeck can't compile this (needs a build toolchain) — copy and run this block; it embeds the chain URL <span class="mono">${esc(b.chainUrl)}</span> and drops the binary straight into the TFTP directory:</p>
+          <pre id="snponly-cmd-pre" style="max-height:260px;overflow:auto">${esc(b.command)}</pre>`,
+        confirmText: "Copy to clipboard",
+      }).then((ok) => {
+        if (ok) navigator.clipboard.writeText(b.command).then(() => toast("Build command copied"));
+      });
+    } catch (err) { toast(err.message, "err"); }
+    return;
+  }
+
+  if (e.target.closest("[data-wizard-snponly-upload]")) {
+    e.preventDefault();
+    $("#snponly-upload").click();
+  }
+});
+
+$("#wizard-steps").addEventListener("change", async (e) => {
+  if (e.target.id !== "snponly-upload" || !e.target.files[0]) return;
+  try {
+    const buf = await e.target.files[0].arrayBuffer();
+    const res = await fetch("/api/setup/upload-snponly", {
+      method: "POST", credentials: "same-origin",
+      headers: { "Content-Type": "application/octet-stream" }, body: buf,
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok) throw new Error((data && data.error) || res.statusText);
+    toast(`snponly.efi uploaded (${fmtBytes(data.size)})`);
+    loadWizard(); loadSetup();
+  } catch (err) { toast(err.message, "err"); }
+  e.target.value = "";
+});
+
+$("#diag-run").addEventListener("click", async () => {
+  const root = $("#diag-results");
+  root.innerHTML = '<div class="muted">Running…</div>';
+  try {
+    const r = await api("GET", "/api/setup/diagnostics");
+    root.innerHTML = (r.checks || []).map((c) => `
+      <div class="row" style="padding:4px 0">
+        <span class="tag ${c.ok ? (c.warn ? "" : "toggle-on") : ""}" style="${c.ok ? (c.warn ? "color:var(--amber);border-color:var(--amber)" : "") : "color:var(--red);border-color:var(--red)"}">${c.ok ? (c.warn ? "warn" : "pass") : "fail"}</span>
+        <span class="mono muted" style="min-width:110px">${esc(c.id)}</span>
+        <span style="flex:1">${esc(c.detail)}</span>
+      </div>`).join("");
+  } catch (err) { root.innerHTML = `<div class="msg err">${esc(err.message)}</div>`; }
+});
+
+$("#bf-refresh").addEventListener("click", () => { loadSetup(); loadWizard(); });
 
 $("#bf-download-wimboot").addEventListener("click", async () => {
   const btn = $("#bf-download-wimboot");
@@ -1258,7 +1383,7 @@ function switchView(v) {
   $("#sidebar").classList.remove("open");
   if (v === "golden") loadGolden();
   else if (v === "reconcile") loadReconcile();
-  else if (v === "setup") loadSetup();
+  else if (v === "setup") { loadSetup(); loadWizard(); }
   else if (v === "settings") loadSettings();
   else if (v === "events") loadEvents();
 }
