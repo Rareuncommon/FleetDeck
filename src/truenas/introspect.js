@@ -31,7 +31,13 @@ function hintSubstring(capability) {
   return lower;
 }
 
-async function resolveMethods(client, candidates) {
+// `optional` capabilities resolve to null instead of throwing when no
+// candidate exists on the server. Core capabilities (snapshot/dataset/iscsi
+// target plumbing) stay hard requirements — FleetDeck is useless without
+// them — but setup-wizard extras (service control, portal/share creation)
+// vary by TrueNAS build, and an older build must degrade to "do this in the
+// TrueNAS UI" guidance rather than refuse to start at all.
+async function resolveMethods(client, candidates, optional = new Set()) {
   const rawMethods = await client.call('core.get_methods');
   const allMethods = extractMethodNames(rawMethods);
   const methodSet = new Set(allMethods);
@@ -40,6 +46,10 @@ async function resolveMethods(client, candidates) {
   for (const [capability, candidateNames] of Object.entries(candidates)) {
     const match = candidateNames.find((name) => methodSet.has(name));
     if (!match) {
+      if (optional.has(capability)) {
+        resolved[capability] = null;
+        continue;
+      }
       const substr = hintSubstring(capability);
       const containing = allMethods.filter((m) => m.toLowerCase().includes(substr));
       throw new Error(

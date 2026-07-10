@@ -19,6 +19,9 @@ const { createPoolRouter } = require('./routes/pool');
 const { createReconcileRouter } = require('./routes/reconcile');
 const { createBulkImportRouter } = require('./routes/bulkImport');
 const { createGoldenBuildRouter } = require('./routes/goldenBuild');
+const { createBootFilesRouter } = require('./routes/bootFiles');
+const { ensureBootDirs, recordBootActivity } = require('./services/bootFiles');
+const { startTftpServer } = require('./services/tftp');
 const { createTrueNasStatusRouter } = require('./routes/truenas');
 const { startSessionPoller } = require('./services/sessionPoller');
 const { startScheduler } = require('./services/scheduler');
@@ -154,7 +157,22 @@ async function main() {
   const app = express();
   app.use(express.json());
 
-  // Unauthenticated: booting firmware cannot do a login flow.
+  // Boot-chain file storage (wimboot/media/snponly.efi) lives beside the DB
+  // on the one persistent volume; create the layout before anything serves.
+  const bootDirs = ensureBootDirs(config);
+
+  // Any /boot/* hit is evidence the DHCP network-boot settings work — track
+  // first/last so the Setup tab's "waiting for first boot request" indicator
+  // reflects reality instead of hope. Must sit before both boot routers.
+  app.use('/boot', (req, res, next) => {
+    recordBootActivity(db, 'http', req.path);
+    next();
+  });
+
+  // /boot/files/* (generated winpe.ipxe + static assets) must be mounted
+  // BEFORE /boot/:macfile so its two-segment paths are never even close to
+  // being parsed as a MAC. Both are unauthenticated: firmware can't log in.
+  app.use(createBootFilesRouter(ctx));
   app.use(createBootRouter(ctx));
 
   // Also unauthenticated: you can't require a session cookie to obtain one.
@@ -226,6 +244,28 @@ async function main() {
   // Additive: the REST API and the frontend's polling fallback stay intact.
   ctx.push = createPushChannel(server, ctx);
 
+  // In-process TFTP for snponly.efi (replaces the dnsmasq side of the old
+  // ipxeboot container). Port 69 needs host networking (which the deployment
+  // already uses) and root; failure to bind degrades to a logged warning —
+  // an external TFTP server remains a valid setup (TFTP_ENABLED=0 skips
+  // this entirely).
+  let tftp = null;
+  if (config.tftpEnabled) {
+    try {
+      tftp = await startTftpServer({
+        root: bootDirs.tftp,
+        port: config.tftpPort,
+        onRead: (filename) => recordBootActivity(db, 'tftp', filename),
+      });
+      console.log(`[server] TFTP serving ${bootDirs.tftp} on udp/${tftp.port}`);
+    } catch (err) {
+      console.error(
+        `[server] TFTP failed to start on udp/${config.tftpPort} (${err.message}); ` +
+          'continuing without TFTP — use an external TFTP server or fix the bind (host networking + root needed for port 69)'
+      );
+    }
+  }
+
   const shutdown = async (signal) => {
     console.log(`[server] received ${signal}, shutting down`);
     reconnect.stop();
@@ -233,6 +273,7 @@ async function main() {
     scheduler.stop();
     if (ctx.poolMonitor) ctx.poolMonitor.stop();
     if (ctx.push) ctx.push.stop();
+    if (tftp) tftp.close();
     server.close();
     if (holder.client) {
       try {
