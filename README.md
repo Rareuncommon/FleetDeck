@@ -2,13 +2,17 @@
 
 FleetDeck is a single-container web app that manages a diskless Windows gaming fleet booting over iSCSI from TrueNAS SCALE. It replaces the manual workflow of hand-editing per-client iPXE scripts and clicking through the TrueNAS UI to clone, snapshot, and retire zvols. One dashboard drives the whole fleet: create a client, reset it to golden, rebase it onto a new golden version, retire it, or promote a new golden image — each as a single action, with every TrueNAS mutation recorded in an events log.
 
+> **What's new in v2:** FleetDeck now absorbs the entire bring-up — it serves the boot chain itself (TFTP + HTTP, retiring the separate ipxeboot container), has a first-run Setup Wizard for the TrueNAS side, a guided Golden Build workflow with a generated WinPE deploy script, guest/kiosk features, fleet-ops tooling (tags, webhooks, `/metrics`, backup/restore, multi-admin), and reliability/observability additions. See [CHANGELOG.md](CHANGELOG.md) for the full list and the [deploy runbook](docs/DEPLOY.md) for setup.
+
 ## Features
 
 - **Dashboard** — live view of every client, its zvol clone, iSCSI target, and last boot; updates are pushed over a WebSocket (`/ws`, same session auth) with automatic fallback to polling. Sortable/searchable client table with pagination, bulk actions (reset/retire/rebase/nightly), a per-client detail drawer with audit history and snapshot lineage, and a Cmd/Ctrl+K command palette.
 - **One-click client lifecycle** — create, reset, rebase, retire, and promote-golden, each a single action against TrueNAS.
 - **Bulk reset + nightly cron** — reset the whole fleet at once, or on a schedule (`node-cron`) for a clean image every morning.
 - **iPXE script serving** — serves per-client boot scripts at `/boot/<mac-hexhyp>.ipxe`, with an unknown-MAC discovery/adopt flow so new machines show up in the dashboard ready to be provisioned.
-- **Golden Build Mode** — arm a machine to boot directly into the live golden image (`sanhook`, not a clone) to service it in place, replacing hand-editing override files on the `ipxeboot` container. Deliberately distinct from Adopt: one session at a time, time-limited with auto-expiry, refuses if TrueNAS already has a session on the golden target, audited throughout. See [docs/DEPLOY.md](docs/DEPLOY.md).
+- **Golden Build Mode** — arm a machine to boot directly into the live golden image (`sanhook`, not a clone) to service it in place, replacing hand-editing override files on the `ipxeboot` container. Deliberately distinct from Adopt: one session at a time, time-limited with auto-expiry, refuses if TrueNAS already has a session on the golden target, audited throughout. Sessions have two phases — `install` (WinPE imaging) and `boot_installed` (sanboot the installed OS) — with a guided, persisted checklist and a **generated `deploy.cmd`** that automates the whole WinPE marathon: confirmed diskpart, split-WIM-aware `dism` apply, `bcdboot`, the offline-registry `INACCESSIBLE_BOOT_DEVICE` fixes, and safety-script install. See [docs/DEPLOY.md](docs/DEPLOY.md).
+- **Integrated boot-chain serving** — FleetDeck serves everything the boot chain needs itself: TFTP for `snponly.efi` (in-process, read-only), HTTP with Range support for `wimboot`/WinPE media at `/boot/files/*`, and a **generated** `winpe.ipxe` that always references the real on-disk media filenames (case included). The separate nginx+dnsmasq container is retired.
+- **First-run Setup Wizard** — the Setup tab checks and (idempotently, with per-step confirmation and full DRY_RUN payload preview) creates the whole TrueNAS side: datasets, the golden zvol (sparse, 64K blocks), iSCSI service, portal, allow-all initiator group, and the golden target/extent/LUN-0 mapping with real portal groups. Manual steps (DHCP network boot, compiling `snponly.efi`) render as honest checklists with exact values, a generated build command, and a live "first boot request seen" detector. A re-runnable Diagnostics panel self-tests the whole chain, including a real TFTP read and a ranged HTTP self-fetch.
 - **DRY_RUN safety** — introspect TrueNAS read-only before letting FleetDeck mutate anything.
 - **Auto safety-snapshot** — every reset/rebase/retire quarantine-clones the client's pre-wipe zvol before touching it, giving a brief undo window (purged automatically after a retention period).
 - **Wake-on-LAN** — optionally sends a magic packet after a successful reset/rebase, so a nightly wipe leaves the machine booted and ready by morning (opt-in; requires WoL enabled on each client's NIC/firmware).
@@ -68,8 +72,12 @@ Set as env vars in the TrueNAS Custom App, or via `.env` for local/compose. See 
 | `GOLDEN_ZVOL` | Zvol path for the golden (sysprepped) image; snapshots `@gold-vN`. | `Main_pool/iscsi/win-golden` |
 | `CLIENT_ZVOL_ROOT` | Root dataset path where per-client clone zvols live. | `Main_pool/iscsi` |
 | `POOL_NAME` | Pool name for capacity alerting. Defaults to `CLIENT_ZVOL_ROOT`'s first path segment. | `Main_pool` |
+| `BOOTFILES_DIR` | Where the served boot chain (wimboot, WinPE media, `snponly.efi`) lives. | `<dir of DB_PATH>/bootfiles` |
+| `TFTP_ENABLED` | `1` = serve TFTP for `snponly.efi` in-process (needs host networking). `0` keeps an external TFTP server. | `1` |
+| `TFTP_PORT` | TFTP UDP port. `69` needs host networking + root. | `69` |
+| `GIT_COMMIT` / `BUILD_DATE` | Optional Docker build args, baked to env and shown in Settings. | (unset) |
 
-A few more tunables live in the in-app Settings panel rather than as env vars (`wol_enabled`, `wol_broadcast`, `pool_alert_threshold_pct`, `safety_snapshot_retention_days`, `nightly_reset_cron`) since they're safe to change at runtime without a restart.
+Many runtime tunables live in the in-app Settings panel rather than as env vars, so they take effect without a restart: WoL (`wol_enabled`, `wol_broadcast`), alerting (`pool_alert_threshold_pct`), retention (`safety_snapshot_retention_days`), schedules (`nightly_reset_cron`), Golden Build (`winpe_chain_url`, `golden_build_default_minutes`, `nic_boot_services`, `golden_image_index`), SMB staging (`bootfiles_host_path`, `bootfiles_smb_share_name`), guest fleet (`guest_idle_timeout_minutes`, `guest_motd`), webhooks (`webhook_url`, `webhook_events`), auth (`session_timeout_minutes`), and API-key hygiene (`api_key_created_at`, `api_key_max_age_days`). See [docs/DEPLOY.md](docs/DEPLOY.md) for what each does.
 
 ### Wake-on-LAN networking
 

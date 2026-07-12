@@ -1,7 +1,11 @@
 'use strict';
 
-const { listClients, updateClient } = require('../db');
+const {
+  listClients, updateClient, getSetting, logEvent,
+  getOpenSession, openSession, closeSession, markSessionIdleReset,
+} = require('../db');
 const { expireGoldenBuild } = require('./goldenBuild');
+const { resetClient } = require('./clientOps');
 
 function isBooted(client, sessions) {
   return sessions.some((session) => {
@@ -39,6 +43,14 @@ async function pollOnce(ctx) {
     Promise.resolve(listClients(db)),
   ]);
 
+  // Guest idle timeout (0/unset = disabled). LIMITATION, stated plainly:
+  // TrueNAS's session listing exposes no per-session idle/last-activity
+  // metric, so true idle detection is impossible from here — this enforces
+  // "session DURATION exceeds the timeout" instead, which for walk-up guest
+  // hardware is the practical approximation (a session that has existed for
+  // 4 hours gets reclaimed whether or not someone is still at the keyboard).
+  const idleTimeoutMin = parseInt(getSetting(db, 'guest_idle_timeout_minutes', '0'), 10) || 0;
+
   for (const client of clients) {
     // One client's failure (e.g. its zvol was retired mid-poll) must not
     // abort status/space updates for the rest of the fleet this tick.
@@ -59,6 +71,29 @@ async function pollOnce(ctx) {
 
       if (Object.keys(fields).length > 0) {
         updateClient(db, client.id, fields);
+      }
+
+      // Session history rows from status transitions. Only meaningful in
+      // granular mode — 'unknown' never opens or closes anything.
+      const open = getOpenSession(db, client.id);
+      if (status === 'booted' && !open) {
+        openSession(db, client.id);
+      } else if (status === 'offline' && open) {
+        closeSession(db, open.id);
+      } else if (status === 'booted' && open && idleTimeoutMin > 0 && !open.idle_reset_at) {
+        const ageMin = (Date.now() - new Date(open.started_at).getTime()) / 60000;
+        if (ageMin > idleTimeoutMin) {
+          // Mark BEFORE resetting: a forced reset reclones the zvol but the
+          // iSCSI session (and thus 'booted') can persist until the machine
+          // reboots — without the marker this would re-fire every tick.
+          markSessionIdleReset(db, open.id);
+          logEvent(db, {
+            action: 'client.idle_timeout_reset',
+            clientId: client.id,
+            after: { session_minutes: Math.round(ageMin), timeout_minutes: idleTimeoutMin },
+          });
+          await resetClient(ctx, client.id, { force: true });
+        }
       }
     } catch (err) {
       console.error(`[sessionPoller] failed to poll client ${client.id} (${client.name}):`, err);

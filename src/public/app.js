@@ -143,12 +143,18 @@ const state = {
   selected: new Set(),      // client ids (survives re-render + pagination)
   search: "",
   statusFilter: "",
+  tagFilter: "",
   sort: { key: null, dir: 1 }, // null = server order (by id)
   page: 0,
   loadedClientsOnce: false,   // gates the skeleton row rendering
   wsConnected: false,
   truenasConnected: null,     // null until the first ws greeting
+  connState: null,            // { state, attempt, nextRetryAt, lastError }
+  dryRun: false,
   goldenBuild: null,          // active golden build session row, or null
+  clientErrors: {},           // clientId -> last failed audit event
+  auditFilter: { action: "", from: "", to: "" },
+  auditLive: true,
 };
 const PER_PAGE = 50;
 
@@ -182,11 +188,13 @@ function connectWS() {
     } else if (msg.type === "truenas") {
       const was = state.truenasConnected;
       state.truenasConnected = !!(msg.payload && msg.payload.connected);
+      state.connState = msg.payload || null;
       // Only announce transitions, not the greeting a fresh tab receives.
       if (was !== null && was !== state.truenasConnected) {
         toast(state.truenasConnected ? "TrueNAS reconnected" : "TrueNAS connection lost", state.truenasConnected ? "ok" : "err");
       }
       renderStamp();
+      renderConnHealth();
     }
   });
   ws.addEventListener("close", () => {
@@ -199,10 +207,22 @@ function connectWS() {
   ws.addEventListener("error", () => { try { ws.close(); } catch (e) {} });
 }
 
+function auditEventMatches(evt) {
+  const f = state.auditFilter;
+  if (f.action && !String(evt.action || "").startsWith(f.action)) return false;
+  // Date filters are coarse (day granularity); a live event is "now", so it
+  // only shows when the range has no upper bound in the past.
+  if (f.to && new Date(evt.ts || Date.now()) > new Date(new Date(f.to).setHours(23, 59, 59, 999))) return false;
+  return true;
+}
+
 function onPushedEvent(evt) {
   if (!evt) return;
-  // Live-prepend on the Audit tab if it's showing.
-  if ($("#events").classList.contains("active")) prependEventRow(evt);
+  // Live-tail on the Audit tab (item 41): only when enabled and the event
+  // passes the active filter, so the tail respects what you're looking at.
+  if (state.auditLive && $("#events").classList.contains("active") && auditEventMatches(evt)) {
+    prependEventRow(evt);
+  }
   // Refresh an open drawer if the event concerns that client.
   if (drawerClientId != null && evt.client_id === drawerClientId) refreshDrawerEvents();
   // Discovered machines only surface via boot.* audit entries — refresh the
@@ -213,11 +233,56 @@ function onPushedEvent(evt) {
 function renderStamp() {
   const bits = [];
   bits.push(state.wsConnected ? "live" : "polling");
-  if (state.truenasConnected === false) bits.push("truenas down");
   $("#poll-stamp").textContent = bits.join(" · ") + " · " + new Date().toLocaleTimeString();
 }
 
+// Sidebar connection-health dot (items 42/43): green connected, amber
+// reconnecting (with attempt count + a live "next retry in Ns" so recovery
+// reads as recovery, not failure), red down.
+function renderConnHealth() {
+  const root = $("#conn-health");
+  if (!root) return;
+  const c = state.connState;
+  let cls = "down", text = "TrueNAS down", tip = "No TrueNAS connection";
+  if (state.truenasConnected) {
+    cls = "connected"; text = "TrueNAS connected"; tip = "RPC connection healthy";
+  } else if (c && c.state === "reconnecting") {
+    cls = "reconnecting";
+    let secs = "";
+    if (c.nextRetryAt) {
+      const d = Math.max(0, Math.round((new Date(c.nextRetryAt) - Date.now()) / 1000));
+      secs = `, retry in ${d}s`;
+    }
+    text = `reconnecting (#${c.attempt || 1})`;
+    tip = `Reconnecting to TrueNAS — attempt ${c.attempt || 1}${secs}${c.lastError ? `\nlast error: ${c.lastError}` : ""}`;
+  }
+  root.className = "conn " + cls;
+  root.title = tip;
+  root.querySelector(".conn-text").textContent = text;
+}
+
+async function refreshConnHealth() {
+  try {
+    state.connState = await api("GET", "/api/system/connection");
+    state.truenasConnected = state.connState.state === "connected";
+  } catch (e) {}
+  renderConnHealth();
+}
+
+function renderDryRunBanner() {
+  const el2 = $("#dryrun-banner");
+  if (!el2) return;
+  if (state.dryRun) {
+    el2.style.display = "";
+    el2.textContent = "⚠ DRY_RUN — TrueNAS mutations are disabled. FleetDeck logs what it would do but changes nothing.";
+  } else {
+    el2.style.display = "none";
+  }
+}
+
 /* ========================= Client table ================================= */
+
+const clientTags = (c) => String(c.tags || "").split(",").map((s) => s.trim()).filter(Boolean);
 
 function visibleClients() {
   let list = state.clients;
@@ -225,6 +290,7 @@ function visibleClients() {
   if (q) list = list.filter((c) =>
     String(c.name).toLowerCase().includes(q) || String(c.mac).toLowerCase().includes(q));
   if (state.statusFilter) list = list.filter((c) => c.status === state.statusFilter);
+  if (state.tagFilter) list = list.filter((c) => clientTags(c).includes(state.tagFilter));
   if (state.sort.key) {
     const { key, dir } = state.sort;
     list = [...list].sort((a, b) => {
@@ -237,6 +303,16 @@ function visibleClients() {
     });
   }
   return list;
+}
+
+// Inline last-error marker (item 45): most recent failed audit event for the
+// client, hover for detail, sourced from /api/client-errors rather than
+// buried in the Audit tab.
+function lastErrorIcon(clientId) {
+  const e = state.clientErrors[clientId];
+  if (!e) return "";
+  const when = (e.ts || "").replace("T", " ").slice(0, 19);
+  return ` <span class="err-icon" title="${esc(e.action)} — ${esc(when)}">⚠</span>`;
 }
 
 function statusBadge(status) {
@@ -263,20 +339,20 @@ function renderClients() {
 
   body.innerHTML = "";
   for (const c of pageList) {
-    const tr = el("tr", { className: "clickable" });
+    const tr = el("tr", { className: "clickable" + (c.status === "booted" ? " in-use" : "") });
     tr.dataset.id = c.id;
     const picker = state.goldenNames.map((g) =>
       `<option${g === c.golden_snapshot ? " selected" : ""}>${esc(g)}</option>`).join("");
     tr.innerHTML = `
       <td data-th=""><input type="checkbox" class="sel" value="${c.id}"${state.selected.has(String(c.id)) ? " checked" : ""}></td>
-      <td data-th="Name">${esc(c.name)}</td>
+      <td data-th="Name">${esc(c.name)}${lastErrorIcon(c.id)}</td>
       <td data-th="MAC" class="mono">${esc(c.mac)}</td>
       <td data-th="Zvol" class="mono muted">${esc(c.zvol)}</td>
       <td data-th="Golden" class="mono badge">${esc(c.golden_snapshot)}</td>
       <td data-th="Status">${statusBadge(c.status)}</td>
       <td data-th="Space">${fmtBytes(c.space_used_bytes)}</td>
       <td data-th="Last boot" class="muted">${fmtTime(c.last_boot_at)}</td>
-      <td data-th="Flags">${c.boot_golden_once ? '<span class="tag toggle-on">golden-once</span>' : ""}${c.nightly_reset ? ' <span class="tag">nightly</span>' : ""}</td>
+      <td data-th="Flags">${c.boot_golden_once ? '<span class="tag toggle-on">golden-once</span>' : ""}${c.nightly_reset ? ' <span class="tag">nightly</span>' : ""}${heartbeatWarning(c) ? ' <span class="tag warn-hb" title="Booted but the safety-script heartbeat has not arrived — the disk-offline script may not have run">no heartbeat</span>' : ""}</td>
       <td data-th="Actions" class="actions">
         <button data-act="reset" data-id="${c.id}">Reset</button>
         <select data-act="rebase-pick" data-id="${c.id}" style="width:110px"><option value="">Rebase…</option>${picker}</select>
@@ -315,6 +391,15 @@ function renderClients() {
     pager.style.display = "none";
   }
 
+  // Tag filter chips: derived from whatever tags exist right now. Clicking a
+  // chip filters; the active one clears on second click. Selecting all
+  // visible rows (sel-all) then bulk-resetting is "reset-all-by-tag".
+  const allTags = [...new Set(state.clients.flatMap(clientTags))].sort();
+  const chipRoot = $("#tag-chips");
+  chipRoot.innerHTML = allTags.length ? allTags.map((t) =>
+    `<button class="tag${state.tagFilter === t ? " toggle-on" : ""}" data-tag-chip="${esc(t)}" style="cursor:pointer">${esc(t)}${state.tagFilter === t ? " ✕" : ""}</button>`
+  ).join("") : "";
+
   // Sort arrows on headers.
   for (const th of $$("#clients th.sortable")) {
     const base = th.textContent.replace(/ [▲▼]$/, "");
@@ -344,6 +429,7 @@ async function loadClients() {
   try {
     state.clients = await api("GET", "/api/clients");
     state.loadedClientsOnce = true;
+    try { state.clientErrors = await api("GET", "/api/client-errors"); } catch (e) {}
     renderClients();
     renderStamp();
   } catch (e) {}
@@ -355,6 +441,23 @@ async function loadPoolStatus() {
     const r = await api("GET", "/api/pool/status");
     return r && r.status;
   } catch (e) { return null; }
+}
+
+// Inline pool-usage sparkline (item 35), fed by the pool_history table the
+// pool monitor now records (one point per 5 min, pruned server-side).
+function sparklineSVG(points) {
+  if (!points || points.length < 2) return "";
+  const w = 84, h = 20;
+  const vals = points.map((p) => p.used_percent);
+  const min = Math.min(...vals), max = Math.max(...vals);
+  const span = (max - min) || 1;
+  const pts = vals.map((v, i) =>
+    `${((i / (vals.length - 1)) * w).toFixed(1)},${(h - ((v - min) / span) * (h - 3) - 1.5).toFixed(1)}`).join(" ");
+  return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" style="display:block;margin-top:2px"><polyline points="${pts}" fill="none" stroke="var(--accent-d)" stroke-width="1.5"/></svg>`;
+}
+
+async function loadPoolHistory() {
+  try { state.poolHistory = await api("GET", "/api/pool/history"); } catch (e) {}
 }
 
 function renderStatTiles(poolStatus) {
@@ -374,12 +477,12 @@ function renderStatTiles(poolStatus) {
   if (poolStatus && poolStatus.usedPercent != null) {
     const pct = poolStatus.usedPercent;
     const cls = pct >= 95 ? "crit" : pct >= 85 ? "warn" : "";
-    tiles.push({ l: "Pool used", n: pct.toFixed(1) + "%", cls });
+    tiles.push({ l: "Pool used", n: pct.toFixed(1) + "%", cls, spark: sparklineSVG(state.poolHistory) });
   } else {
     tiles.push({ l: "Pool used", n: "—" });
   }
   $("#stat-tiles").innerHTML = tiles.map((t) =>
-    `<div class="tile ${t.cls || ""}"><div class="n">${esc(t.n)}</div><div class="l">${esc(t.l)}</div></div>`).join("");
+    `<div class="tile ${t.cls || ""}"><div class="n">${esc(t.n)}</div><div class="l">${esc(t.l)}</div>${t.spark || ""}</div>`).join("");
 }
 
 async function loadDiscovered() {
@@ -517,6 +620,38 @@ $("#sel-all").addEventListener("change", (e) => {
     else state.selected.delete(c.value);
   }
   updateBulkButtons();
+});
+
+$("#tag-chips").addEventListener("click", (e) => {
+  const chip = e.target.closest("[data-tag-chip]");
+  if (!chip) return;
+  state.tagFilter = state.tagFilter === chip.dataset.tagChip ? "" : chip.dataset.tagChip;
+  state.page = 0;
+  renderClients();
+});
+
+$("#wake-all").addEventListener("click", async () => {
+  try {
+    const r = await api("POST", "/api/clients/wake-all");
+    toast(`Wake-on-LAN sent to ${r.sent} machine(s)${r.failed ? `, ${r.failed} failed` : ""}`);
+  } catch (err) { toast(err.message, "err"); }
+});
+
+// CSV export (item 34): pure client-side from already-loaded, currently
+// filtered data — no server round-trip for something this simple.
+function downloadBlob(name, mime, content) {
+  const a = el("a", { href: URL.createObjectURL(new Blob([content], { type: mime })), download: name });
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+const csvCell = (v) => `"${String(v == null ? "" : v).replace(/"/g, '""')}"`;
+
+$("#export-clients").addEventListener("click", () => {
+  const cols = ["id", "name", "mac", "zvol", "target_name", "golden_snapshot", "status", "tags", "gpu_vendor", "space_used_bytes", "last_boot_at", "notes"];
+  const rows = visibleClients();
+  const csv = [cols.join(","), ...rows.map((c) => cols.map((k) => csvCell(c[k])).join(","))].join("\n");
+  downloadBlob(`fleetdeck-clients-${new Date().toISOString().slice(0, 10)}.csv`, "text/csv", csv);
+  toast(`Exported ${rows.length} client(s)`);
 });
 
 // Search / filter / sort / pagination wiring.
@@ -689,10 +824,28 @@ function lineageHTML(client, events) {
   }).join("");
 }
 
+// A booted client with no heartbeat since its last boot (plus a grace period
+// for the machine to finish starting) means the safety script may not have
+// run — surfaced as a warning badge, not silently assumed fine.
+function heartbeatWarning(c) {
+  if (c.status !== "booted" || !c.last_boot_at) return false;
+  const boot = new Date(c.last_boot_at).getTime();
+  if (Date.now() - boot < 10 * 60 * 1000) return false; // still starting up
+  return !c.last_heartbeat_at || new Date(c.last_heartbeat_at).getTime() < boot;
+}
+
+function fmtDuration(sec) {
+  if (sec == null) return "—";
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60);
+  return h > 0 ? `${h}h ${m}m` : `${m}m`;
+}
+
 async function openDrawer(id) {
   const c = state.clients.find((x) => x.id === id);
   if (!c) return;
   drawerClientId = id;
+  const gpuOpts = ["", "amd", "nvidia", "intel", "unknown"].map((v) =>
+    `<option value="${v}"${(c.gpu_vendor || "") === v ? " selected" : ""}>${v || "— unset —"}</option>`).join("");
   const drawer = $("#drawer-root .drawer");
   drawer.innerHTML = `
     <header>
@@ -701,6 +854,8 @@ async function openDrawer(id) {
       <button data-close>✕</button>
     </header>
     <div class="content">
+      ${c.status === "booted" ? `<div class="inuse-banner"><span class="dot"></span>IN USE — live iSCSI session on this machine</div>` : ""}
+      ${heartbeatWarning(c) ? `<div class="inuse-banner" style="border-color:var(--amber);background:rgba(217,164,65,.1);color:var(--amber)">⚠ No safety-script heartbeat since boot — local disks may not be offline</div>` : ""}
       <div class="kv">
         <span class="k">MAC</span><span class="mono">${esc(c.mac)}</span>
         <span class="k">Zvol</span><span class="mono">${esc(c.zvol)}</span>
@@ -708,19 +863,100 @@ async function openDrawer(id) {
         <span class="k">Golden</span><span class="mono">${esc(c.golden_snapshot)}</span>
         <span class="k">Space</span><span>${fmtBytes(c.space_used_bytes)}</span>
         <span class="k">Last boot</span><span>${fmtTime(c.last_boot_at)}</span>
+        <span class="k">Heartbeat</span><span>${fmtTime(c.last_heartbeat_at)}</span>
         <span class="k">Created</span><span>${fmtTime(c.created_at)}</span>
+        <span class="k">GPU</span><span><select data-gpu style="width:120px">${gpuOpts}</select></span>
+        <span class="k">Tags</span><span><input data-tags class="mono" style="width:180px" value="${esc(c.tags || "")}" placeholder="vip,corner (comma-sep)"></span>
+        <span class="k">Notes</span><span><input data-notes style="width:180px" value="${esc(c.notes || "")}" placeholder="free text"></span>
         <span class="k">Flags</span><span>${c.boot_golden_once ? '<span class="tag toggle-on">golden-once</span> ' : ""}${c.nightly_reset ? '<span class="tag">nightly</span>' : ""}</span>
+      </div>
+      <div class="row" style="margin-bottom:12px">
+        <button class="danger" data-kick title="TrueNAS's API cannot terminate an iSCSI session, so this wipes and re-clones the disk under the live session — the machine keeps running from cache until reboot">Kick (forced reset)</button>
+        <button data-qr>QR sticker</button>
+        <button data-gap>Report driver gap</button>
       </div>
       <h2>Snapshot lineage</h2>
       <div data-lineage><div class="skel" style="height:40px"></div></div>
       <h2>Session history</h2>
-      <div class="muted">Per-session history lands with the sessions table (Phase 2); this panel will list start/end/duration here.</div>
+      <div data-sessions><div class="skel" style="height:40px"></div></div>
       <h2>Audit history</h2>
       <div data-drawer-events><div class="skel" style="height:80px"></div></div>
     </div>`;
   drawer.querySelector("[data-close]").addEventListener("click", closeDrawer);
+
+  drawer.querySelector("[data-gpu]").addEventListener("change", async (e) => {
+    try {
+      await api("POST", `/api/clients/${id}/meta`, { gpu_vendor: e.target.value || null });
+      toast("GPU vendor saved");
+      loadClients();
+    } catch (err) { toast(err.message, "err"); }
+  });
+  // Tags/notes save on blur or Enter, not per keystroke.
+  for (const [sel, field, label] of [["[data-tags]", "tags", "Tags"], ["[data-notes]", "notes", "Notes"]]) {
+    const input = drawer.querySelector(sel);
+    const save = async () => {
+      try {
+        await api("POST", `/api/clients/${id}/meta`, { [field]: input.value });
+        toast(`${label} saved`);
+        loadClients();
+      } catch (err) { toast(err.message, "err"); }
+    };
+    input.addEventListener("change", save);
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") input.blur(); });
+  }
+
+  drawer.querySelector("[data-kick]").addEventListener("click", async () => {
+    const ok = await confirmModal("Kick (forced reset)",
+      `<p><b>Honest label:</b> the TrueNAS API has no way to terminate a specific iSCSI session, so "kick" force-resets the disk: it is wiped and re-cloned <b>under the live session</b>. The machine keeps running from cache until it reboots, at which point it gets the clean image.</p>`,
+      { danger: true, confirmText: "Force reset" });
+    if (!ok) return;
+    try {
+      await api("POST", `/api/clients/${id}/kick`);
+      toast(`${c.name}: kicked (forced reset)`);
+      loadClients();
+    } catch (err) { toast(err.message, "err"); }
+  });
+
+  drawer.querySelector("[data-qr]").addEventListener("click", () => {
+    // Print-friendly window: QR + machine name, sized for a sticker.
+    const w = window.open("", "_blank", "width=340,height=420");
+    w.document.write(`<title>${esc(c.name)} QR</title>
+      <div style="font-family:system-ui;text-align:center;padding:16px">
+      <img src="/api/clients/${id}/qr.svg" width="240" height="240" alt="QR">
+      <div style="font-size:20px;font-weight:700;margin-top:8px">${esc(c.name)}</div>
+      <div style="font-size:12px;color:#555">Scan for troubleshooting help</div>
+      <button onclick="print()" style="margin-top:12px">Print</button></div>`);
+  });
+
+  drawer.querySelector("[data-gap]").addEventListener("click", async () => {
+    const vals = await openModal({
+      title: `Report a driver gap (${c.name})`,
+      bodyHTML: "<p>Logged against the current golden image and listed on the Golden tab as a known gap — e.g. a device that has no driver after imaging.</p>",
+      confirmText: "Report",
+      fields: [{ name: "description", label: "What's missing?", placeholder: "e.g. Realtek 2.5GbE NIC shows as Unknown Device" }],
+    });
+    if (!vals || !vals.description.trim()) return;
+    try {
+      await api("POST", "/api/hardware-gaps", { client_id: id, mac: c.mac, description: vals.description.trim() });
+      toast("Driver gap reported");
+    } catch (err) { toast(err.message, "err"); }
+  });
+
   $("#drawer-root").classList.add("open");
   await refreshDrawerEvents();
+  // Session history (populated by the poller's status transitions).
+  try {
+    const sessions = await api("GET", `/api/clients/${id}/sessions`);
+    const root = $("#drawer-root [data-sessions]");
+    if (root) {
+      root.innerHTML = sessions.length ? sessions.map((s) => `
+        <div class="evt${s.idle_reset_at ? " fail" : ""}">
+          <div>${esc(fmtTime(s.started_at))} → ${s.ended_at ? esc(fmtTime(s.ended_at)) : '<b style="color:var(--accent)">active</b>'}
+            <span class="muted">(${fmtDuration(s.duration_seconds)})</span>
+            ${s.idle_reset_at ? '<span class="tag warn-hb">idle-timeout reset</span>' : ""}</div>
+        </div>`).join("") : '<div class="muted">No sessions recorded yet.</div>';
+    }
+  } catch (e) {}
 }
 
 async function refreshDrawerEvents() {
@@ -788,6 +1024,7 @@ async function loadGoldenBuildStatus() {
   try {
     const r = await api("GET", "/api/golden-build/status");
     state.goldenBuild = (r && r.active) || null;
+    state.goldenBuildChecklist = (r && r.checklist) || [];
   } catch (e) { return; }
   renderGoldenBuildBanner();
   applyGoldenBuildDisabled();
@@ -809,18 +1046,68 @@ function renderGoldenBuildBanner() {
   if (!root) return;
   const gb = state.goldenBuild;
   if (!gb) { root.innerHTML = ""; return; }
-  root.innerHTML = `<div class="gb-banner">
-    <span class="icon">⚠️</span>
-    <div>
-      <div class="headline">Golden Build Mode is ACTIVE</div>
-      <div class="detail">Machine <span class="mono">${esc(gb.mac)}</span> has direct write access to the live golden image. Every client cloned or reset after this session inherits its changes.</div>
+
+  const phase = gb.phase || "install";
+  const phaseChip = phase === "install"
+    ? '<span class="tag" style="color:var(--amber);border-color:var(--amber)">phase: install (WinPE)</span>'
+    : '<span class="tag toggle-on">phase: boot_installed (sanboot)</span>';
+  const otherPhase = phase === "install" ? "boot_installed" : "install";
+
+  let checklistState = {};
+  try { checklistState = JSON.parse(gb.checklist_json || "{}"); } catch (e) {}
+  const items = (state.goldenBuildChecklist || []).map((step) => `
+    <label class="row" style="padding:2px 0;gap:8px;cursor:pointer">
+      <input type="checkbox" data-gb-check="${esc(step.id)}"${checklistState[step.id] ? " checked" : ""}>
+      <span class="${checklistState[step.id] ? "muted" : ""}" style="${checklistState[step.id] ? "text-decoration:line-through" : ""}">${esc(step.label)}</span>
+    </label>`).join("");
+
+  root.innerHTML = `<div class="gb-banner" style="flex-direction:column;align-items:stretch">
+    <div class="row" style="gap:14px">
+      <span class="icon">⚠️</span>
+      <div>
+        <div class="headline">Golden Build Mode is ACTIVE ${phaseChip}</div>
+        <div class="detail">Machine <span class="mono">${esc(gb.mac)}</span> has direct write access to the live golden image. Every client cloned or reset after this session inherits its changes.</div>
+      </div>
+      <span class="spacer"></span>
+      <div class="detail">Auto-expires in <span class="remain">${esc(fmtRemaining(gb.expires_at))}</span></div>
+      <button id="gb-phase">Switch to ${esc(otherPhase)}</button>
+      <button class="danger" id="gb-end">End session</button>
     </div>
-    <span class="spacer"></span>
-    <div class="detail">Auto-expires in <span class="remain">${esc(fmtRemaining(gb.expires_at))}</span></div>
-    <button class="danger" id="gb-end">End session</button>
+    <div style="margin-top:8px;border-top:1px solid var(--border);padding-top:8px">
+      <div class="detail" style="margin-bottom:4px"><b>Guided workflow</b> — the un-automatable steps are instructions; tick them off as you go (persisted on the session):</div>
+      ${items}
+      <div class="detail" style="margin-top:6px">
+        Fetch the deploy script in WinPE — SMB is the guaranteed transport (PowerShell is an optional WinPE component, present on most retail Setup media but not promised):<br>
+        <span class="mono">net use M: \\\\&lt;truenas-host&gt;\\fleetdeck-bootfiles &amp;&amp; M:\\deploy.cmd</span><br>
+        or, where PowerShell exists in the boot.wim:<br>
+        <span class="mono">powershell -c "iwr http://${esc(location.host)}/boot/files/deploy.cmd -OutFile X:\\d.cmd" &amp;&amp; X:\\d.cmd</span>
+      </div>
+    </div>
   </div>`;
-  const endBtn = $("#gb-end");
-  if (endBtn) endBtn.addEventListener("click", goldenBuildEndFlow);
+
+  $("#gb-end").addEventListener("click", goldenBuildEndFlow);
+  $("#gb-phase").addEventListener("click", () => goldenBuildPhaseFlow(otherPhase));
+  root.querySelectorAll("[data-gb-check]").forEach((cb) => cb.addEventListener("change", async (e) => {
+    try {
+      const session = await api("POST", "/api/golden-build/checklist", { step: e.target.dataset.gbCheck, done: e.target.checked });
+      state.goldenBuild = session;
+      renderGoldenBuildBanner();
+    } catch (err) { toast(err.message, "err"); }
+  }));
+}
+
+async function goldenBuildPhaseFlow(phase) {
+  const explain = phase === "boot_installed"
+    ? "<p>Switch AFTER the deploy script finished (image applied, bcdboot run). The machine's next PXE boot will <b>sanboot the installed OS</b> from the golden zvol instead of loading WinPE.</p>"
+    : "<p>Switch back to the install phase: the machine's next PXE boot loads <b>WinPE for imaging</b> again (e.g. to redo a failed apply).</p>";
+  const ok = await confirmModal(`Switch phase to ${phase}`, explain, { confirmText: "Switch phase" });
+  if (!ok) return;
+  try {
+    const session = await api("POST", "/api/golden-build/phase", { phase });
+    state.goldenBuild = session;
+    toast(`Phase switched to ${phase}`);
+    renderGoldenBuildBanner();
+  } catch (err) { toast(err.message, "err"); }
 }
 
 async function goldenBuildEndFlow() {
@@ -851,8 +1138,35 @@ function applyGoldenBuildDisabled() {
 
 /* ============================ Golden tab ================================ */
 
+async function loadHardwareGaps() {
+  let gaps = [];
+  try { gaps = await api("GET", "/api/hardware-gaps"); } catch (e) { return; }
+  const body = $("#gaps-body");
+  body.innerHTML = gaps.length ? "" : '<tr><td colspan="4" class="muted">None reported</td></tr>';
+  for (const g of gaps) {
+    const c = state.clients.find((x) => x.id === g.client_id);
+    const tr = el("tr");
+    tr.innerHTML = `<td class="muted">${fmtTime(g.created_at)}</td>
+      <td>${esc(c ? c.name : (g.mac || "—"))}</td>
+      <td>${esc(g.description)}</td>
+      <td><button data-gap-resolve="${g.id}">Resolved in new image</button></td>`;
+    body.appendChild(tr);
+  }
+}
+
+$("#gaps-body").addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-gap-resolve]");
+  if (!b) return;
+  try {
+    await api("DELETE", `/api/hardware-gaps/${b.dataset.gapResolve}`);
+    toast("Gap marked resolved");
+    loadHardwareGaps();
+  } catch (err) { toast(err.message, "err"); }
+});
+
 async function loadGolden() {
   await loadGoldenBuildStatus();
+  loadHardwareGaps();
   let snaps = [];
   try { snaps = await api("GET", "/api/golden/snapshots"); } catch (e) { return; }
   state.goldenNames = snaps.map((s) => s.name);
@@ -873,19 +1187,52 @@ async function loadGolden() {
     return;
   }
   $("#golden-empty").innerHTML = "";
+  // Fleet-version view (item 36): the newest gold-vN is the rebase target;
+  // every older snapshot that still has clients gets a one-click "move these
+  // N to latest" alongside the existing rebase-stragglers-to-this action.
+  const latest = state.goldenNames.reduce((best, n) => {
+    const v = (n.match(/^gold-v(\d+)$/) || [])[1];
+    const bv = (best && best.match(/^gold-v(\d+)$/) || [])[1];
+    return v && (!bv || parseInt(v, 10) > parseInt(bv, 10)) ? n : best;
+  }, state.goldenNames[0]);
   for (const s of snaps) {
     const on = (s.clients || []).map((c) => esc(c.name)).join(", ") || '<span class="muted">none</span>';
+    const stale = s.name !== latest && (s.clients || []).length > 0;
     const tr = el("tr");
-    tr.innerHTML = `<td class="mono">${esc(s.name)}</td><td>${fmtBytes(s.used)}</td>
+    tr.innerHTML = `<td class="mono">${esc(s.name)}${s.name === latest ? ' <span class="tag toggle-on">latest</span>' : ""}</td><td>${fmtBytes(s.used)}</td>
       <td>${on} <span class="muted">(${(s.clients || []).length})</span></td>
-      <td><button data-snap="${esc(s.name)}" data-act="bulk-rebase">Rebase stragglers here</button></td>`;
+      <td class="actions">
+        <button data-snap="${esc(s.name)}" data-act="bulk-rebase">Rebase stragglers here</button>
+        ${stale ? `<button class="accent" data-act="move-latest" data-snap="${esc(s.name)}" data-latest="${esc(latest)}" data-ids="${(s.clients || []).map((c) => c.id).join(",")}">Move ${(s.clients || []).length} → ${esc(latest)}</button>` : ""}
+      </td>`;
     body.appendChild(tr);
   }
 }
 
 $("#golden-body").addEventListener("click", async (e) => {
   const b = e.target.closest("button");
-  if (!b || b.dataset.act !== "bulk-rebase") return;
+  if (!b) return;
+  if (b.dataset.act === "move-latest") {
+    const ids = b.dataset.ids.split(",").map(Number).filter(Boolean);
+    const target = b.dataset.latest;
+    const ok = await confirmModal("Rebase to latest",
+      `<p>Rebase the ${ids.length} client(s) still on <b class="mono">${esc(b.dataset.snap)}</b> onto <b class="mono">${esc(target)}</b>? Their disks are wiped and re-cloned (session-active machines are skipped, with a force pass offered).</p>`,
+      { confirmText: "Rebase" });
+    if (!ok) return;
+    try {
+      const r = await api("POST", "/api/golden/bulk-rebase", { clientIds: ids, goldenSnapshot: target, force: false });
+      const results = r.results || [];
+      const stuck = results.filter((x) => !x.ok && /session/i.test(x.error || "")).map((x) => x.id);
+      const fail = results.filter((x) => !x.ok && !stuck.includes(x.id)).length;
+      toast(`Rebased ${results.length - fail - stuck.length} ok, ${fail} failed${stuck.length ? `, ${stuck.length} skipped (active session)` : ""}`, fail ? "err" : "ok");
+      if (stuck.length && await confirmModal("Force rebase stuck", `<p>${stuck.length} client(s) have an active session.</p>`, { danger: true, confirmText: `Force rebase ${stuck.length}` })) {
+        await api("POST", "/api/golden/bulk-rebase", { clientIds: stuck, goldenSnapshot: target, force: true });
+      }
+      loadClients(); loadGolden();
+    } catch (err) { toast(err.message, "err"); }
+    return;
+  }
+  if (b.dataset.act !== "bulk-rebase") return;
   const snap = b.dataset.snap;
   try { if (!state.clients.length) state.clients = await api("GET", "/api/clients"); } catch (er) {}
   const ids = state.clients.filter((c) => c.golden_snapshot !== snap).map((c) => c.id);
@@ -1050,7 +1397,132 @@ async function loadSetup() {
   $("#boot-activity").innerHTML = ind("TFTP", act.tftp) + ind("HTTP /boot", act.http);
 }
 
-$("#bf-refresh").addEventListener("click", loadSetup);
+/* ---- TrueNAS setup wizard ---- */
+
+function wizardStepRow(step) {
+  const icon = step.supported === false
+    ? '<span class="tag">API n/a</span>'
+    : step.ok
+      ? '<span class="tag toggle-on">✓</span>'
+      : '<span class="tag" style="color:var(--amber);border-color:var(--amber)">todo</span>';
+  let action = "";
+  if (step.kind === "rpc" && !step.ok && step.supported !== false) {
+    action = `<button class="accent" data-wizard-apply="${esc(step.id)}">Create</button>`;
+  } else if (step.id === "snponly") {
+    action = `<button data-wizard-snponly-cmd>Build command</button>
+      <label style="display:inline-block"><input type="file" id="snponly-upload" style="display:none">
+      <button data-wizard-snponly-upload>Upload prebuilt</button></label>`;
+  }
+  return `<div class="row" style="padding:6px 0;border-bottom:1px solid var(--border)">
+    ${icon}
+    <b style="min-width:230px">${esc(step.title)}</b>
+    <span class="muted" style="flex:1">${esc(step.detail || "")}</span>
+    ${action}
+  </div>`;
+}
+
+async function loadWizard() {
+  let s = null;
+  try { s = await api("GET", "/api/setup/status"); } catch (e) { return; }
+  const root = $("#wizard-steps");
+  if (!s.adapterAvailable) {
+    root.innerHTML = '<div class="muted">TrueNAS is unreachable — the wizard needs a live connection for its checks. It will populate once reconnected.</div>'
+      + s.steps.filter((x) => x.kind === "manual").map(wizardStepRow).join("");
+    return;
+  }
+  root.innerHTML = (s.dryRun ? '<div class="muted" style="margin-bottom:6px">DRY_RUN=1 — Create buttons show the exact would-be RPCs and execute nothing.</div>' : "")
+    + s.steps.map(wizardStepRow).join("");
+}
+
+$("#wizard-steps").addEventListener("click", async (e) => {
+  const applyBtn = e.target.closest("[data-wizard-apply]");
+  if (applyBtn) {
+    const stepId = applyBtn.dataset.wizardApply;
+    try {
+      // Fetch the exact plan first so the confirm modal shows real payloads.
+      const preview = await api("POST", `/api/setup/apply/${stepId}`, { planOnly: true });
+      if (preview.already) { toast(preview.detail); loadWizard(); return; }
+      if (preview.supported === false) { toast(preview.detail, "err"); return; }
+      const isGolden = stepId === "golden_zvol";
+      const vals = await openModal({
+        title: `Create: ${stepId}`,
+        confirmText: "Create",
+        bodyHTML: `<p>FleetDeck will run these TrueNAS RPCs, in order:</p>
+          <pre>${esc(JSON.stringify(preview.plan, null, 2))}</pre>
+          ${isGolden ? '<p>Adjust the size below if needed (the plan updates server-side).</p>' : ""}`,
+        fields: isGolden ? [{ name: "sizeGib", label: "Golden zvol size (GiB)", value: "256" }] : null,
+      });
+      if (!vals) return;
+      const body = isGolden ? { sizeGib: parseInt(vals.sizeGib, 10) || 256 } : {};
+      const result = await api("POST", `/api/setup/apply/${stepId}`, body);
+      if (result.dryRun) {
+        await openModal({
+          title: "DRY_RUN: nothing executed",
+          bodyHTML: `<p>These RPCs were logged but not run:</p><pre>${esc(JSON.stringify(result.payloads, null, 2))}</pre>`,
+          confirmText: "OK",
+        });
+      } else if (result.already) {
+        toast(result.detail);
+      } else {
+        toast(`${stepId}: created`);
+      }
+      loadWizard(); loadSetup();
+    } catch (err) { toast(err.message, "err"); }
+    return;
+  }
+
+  if (e.target.closest("[data-wizard-snponly-cmd]")) {
+    try {
+      const b = await api("GET", "/api/setup/snponly-build");
+      await openModal({
+        title: "Build snponly.efi (run on any Docker host)",
+        bodyHTML: `<p>FleetDeck can't compile this (needs a build toolchain) — copy and run this block; it embeds the chain URL <span class="mono">${esc(b.chainUrl)}</span> and drops the binary straight into the TFTP directory:</p>
+          <pre id="snponly-cmd-pre" style="max-height:260px;overflow:auto">${esc(b.command)}</pre>`,
+        confirmText: "Copy to clipboard",
+      }).then((ok) => {
+        if (ok) navigator.clipboard.writeText(b.command).then(() => toast("Build command copied"));
+      });
+    } catch (err) { toast(err.message, "err"); }
+    return;
+  }
+
+  if (e.target.closest("[data-wizard-snponly-upload]")) {
+    e.preventDefault();
+    $("#snponly-upload").click();
+  }
+});
+
+$("#wizard-steps").addEventListener("change", async (e) => {
+  if (e.target.id !== "snponly-upload" || !e.target.files[0]) return;
+  try {
+    const buf = await e.target.files[0].arrayBuffer();
+    const res = await fetch("/api/setup/upload-snponly", {
+      method: "POST", credentials: "same-origin",
+      headers: { "Content-Type": "application/octet-stream" }, body: buf,
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok) throw new Error((data && data.error) || res.statusText);
+    toast(`snponly.efi uploaded (${fmtBytes(data.size)})`);
+    loadWizard(); loadSetup();
+  } catch (err) { toast(err.message, "err"); }
+  e.target.value = "";
+});
+
+$("#diag-run").addEventListener("click", async () => {
+  const root = $("#diag-results");
+  root.innerHTML = '<div class="muted">Running…</div>';
+  try {
+    const r = await api("GET", "/api/setup/diagnostics");
+    root.innerHTML = (r.checks || []).map((c) => `
+      <div class="row" style="padding:4px 0">
+        <span class="tag ${c.ok ? (c.warn ? "" : "toggle-on") : ""}" style="${c.ok ? (c.warn ? "color:var(--amber);border-color:var(--amber)" : "") : "color:var(--red);border-color:var(--red)"}">${c.ok ? (c.warn ? "warn" : "pass") : "fail"}</span>
+        <span class="mono muted" style="min-width:110px">${esc(c.id)}</span>
+        <span style="flex:1">${esc(c.detail)}</span>
+      </div>`).join("");
+  } catch (err) { root.innerHTML = `<div class="msg err">${esc(err.message)}</div>`; }
+});
+
+$("#bf-refresh").addEventListener("click", () => { loadSetup(); loadWizard(); });
 
 $("#bf-download-wimboot").addEventListener("click", async () => {
   const btn = $("#bf-download-wimboot");
@@ -1105,6 +1577,25 @@ const SETTINGS_DEFAULTS = {
   // /mnt/Main_pool/apps/fleetdeck) — needed to create the SMB staging share.
   bootfiles_host_path: "",
   bootfiles_smb_share_name: "fleetdeck-bootfiles",
+  // deploy.cmd generation: NIC driver services that need Start=0 for iSCSI
+  // boot, and an optional preselected dism image index ("" = prompt in WinPE).
+  nic_boot_services: "rt640x64,e1d,e2f,e1i65x64",
+  golden_image_index: "",
+  // Guest fleet: 0 = disabled. NOTE: TrueNAS exposes no per-session idle
+  // metric, so this enforces total session DURATION, not true idleness.
+  guest_idle_timeout_minutes: "0",
+  // Shown as a banner on the public /status page (FleetDeck cannot display
+  // text inside Windows itself; bake anything in-OS into the golden image).
+  guest_motd: "",
+  // Outbound webhook: generic JSON POST, events comma-separated.
+  webhook_url: "",
+  webhook_events: "pool_warning,reset_failed,nightly_summary",
+  // Admin session cookie lifetime (was hardcoded 12h).
+  session_timeout_minutes: "720",
+  // Set manually when you (re)create the TrueNAS API key — TrueNAS doesn't
+  // expose key creation dates, so rotation hygiene needs the operator's help.
+  api_key_created_at: "",
+  api_key_max_age_days: "180",
 };
 async function loadSettings() {
   let s = {};
@@ -1117,7 +1608,188 @@ async function loadSettings() {
     inp.dataset.key = k;
     g.appendChild(inp);
   }
+  loadSystemInfo(merged);
+  loadWindows();
+  loadAdmins();
+  loadConfigWarnings();
+  loadChangelog();
 }
+
+async function loadConfigWarnings() {
+  let warns = [];
+  try { warns = await api("GET", "/api/system/warnings"); } catch (e) { return; }
+  const root = $("#config-warnings");
+  root.innerHTML = warns.length
+    ? warns.map((w) => `<div class="selftest-row"><span class="tag warn-hb">${esc(w.key)}</span><span class="muted">${esc(w.text)}</span></div>`).join("")
+    : '<div class="muted">No configuration warnings.</div>';
+}
+
+$("#self-test").addEventListener("click", async () => {
+  const root = $("#self-test-results");
+  root.innerHTML = '<div class="muted">Running…</div>';
+  try {
+    const r = await api("GET", "/api/system/self-test");
+    root.innerHTML = (r.checks || []).map((c) => `
+      <div class="selftest-row">
+        <span class="tag ${c.ok ? (c.warn ? "warn-hb" : "toggle-on") : ""}" style="${c.ok ? "" : "color:var(--red);border-color:var(--red)"}">${c.ok ? (c.warn ? "warn" : "pass") : "fail"}</span>
+        <span class="mono muted" style="min-width:110px">${esc(c.id)}</span>
+        <span style="flex:1">${esc(c.detail)}</span>
+      </div>`).join("");
+  } catch (err) { root.innerHTML = `<div class="msg err">${esc(err.message)}</div>`; }
+});
+
+async function loadChangelog() {
+  let r = null;
+  try { r = await api("GET", "/api/system/changelog"); } catch (e) { return; }
+  const root = $("#changelog");
+  root.innerHTML = (r.entries || []).map((e, i) => `
+    <div style="margin-bottom:10px">
+      <div><b class="${e.version === r.latest && r.unread ? "" : ""}">${esc(e.version)}</b>${e.version === r.latest && r.unread ? ' <span class="tag warn-hb">new since your last visit</span>' : ""}</div>
+      <div class="muted" style="white-space:pre-wrap;font-size:12px">${esc(e.body)}</div>
+    </div>`).join("");
+  $("#changelog-unread").style.display = r.unread ? "" : "none";
+  // Mark seen when the panel is viewed (a named admin remembers this).
+  if (r.unread) {
+    try { await api("POST", "/api/system/changelog/seen"); } catch (e) {}
+  }
+}
+
+async function loadSystemInfo(settings) {
+  try {
+    const info = await api("GET", "/api/system/info");
+    const bits = [`<span class="tag">v${esc(info.version)}</span>`];
+    if (info.gitCommit) bits.push(`<span class="tag mono">${esc(info.gitCommit.slice(0, 8))}</span>`);
+    if (info.buildDate) bits.push(`<span class="muted">built ${esc(info.buildDate)}</span>`);
+    if (info.adminUser) bits.push(`<span class="muted">logged in as <b>${esc(info.adminUser)}</b></span>`);
+    if (info.update && info.update.updateAvailable) {
+      bits.push(`<a class="tag" style="color:var(--amber);border-color:var(--amber)" href="${esc(info.update.url)}" target="_blank">update available: v${esc(info.update.latest)}</a>`);
+    }
+    $("#system-info").innerHTML = bits.join(" ");
+  } catch (e) {}
+
+  // API-key rotation hygiene (item 40): age computed from the manually-set
+  // creation date, since TrueNAS doesn't expose it.
+  const banner = $("#apikey-banner");
+  const createdAt = settings.api_key_created_at;
+  const maxDays = parseInt(settings.api_key_max_age_days, 10) || 180;
+  if (createdAt && !isNaN(new Date(createdAt))) {
+    const ageDays = Math.floor((Date.now() - new Date(createdAt).getTime()) / 86400000);
+    banner.innerHTML = ageDays > maxDays
+      ? `<div class="gb-banner" style="margin-top:10px"><span class="icon">🔑</span><div><div class="headline">TrueNAS API key is ${ageDays} days old</div><div class="detail">Older than the ${maxDays}-day rotation threshold — rotate it in TrueNAS (Settings &gt; API Keys), update TRUENAS_API_KEY, and set api_key_created_at to today.</div></div></div>`
+      : `<div class="muted" style="margin-top:8px">API key age: ${ageDays} days (rotation threshold ${maxDays}).</div>`;
+  } else {
+    banner.innerHTML = `<div class="muted" style="margin-top:8px">Set <span class="mono">api_key_created_at</span> (e.g. 2026-07-01) to enable API-key age tracking.</div>`;
+  }
+}
+
+async function loadWindows() {
+  let list = [];
+  try { list = await api("GET", "/api/maintenance-windows"); } catch (e) { return; }
+  const body = $("#windows-body");
+  body.innerHTML = list.length ? "" : '<tr><td colspan="4" class="muted">None — only the global nightly cron applies</td></tr>';
+  for (const w of list) {
+    const tr = el("tr");
+    tr.innerHTML = `<td>${w.tag ? esc(w.tag) : '<span class="muted">(all clients)</span>'}</td>
+      <td class="mono">${esc(w.cron)}</td><td>${esc(w.action)}</td>
+      <td><button class="danger" data-window-del="${w.id}">Delete</button></td>`;
+    body.appendChild(tr);
+  }
+}
+
+$("#windows-body").addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-window-del]");
+  if (!b) return;
+  try {
+    await api("DELETE", `/api/maintenance-windows/${b.dataset.windowDel}`);
+    toast("Window deleted");
+    loadWindows();
+  } catch (err) { toast(err.message, "err"); }
+});
+
+$("#window-add").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const f = e.target;
+  try {
+    await api("POST", "/api/maintenance-windows", { tag: f.tag.value.trim(), cron: f.cron.value.trim(), action: f.action.value });
+    toast("Maintenance window added");
+    f.reset();
+    loadWindows();
+  } catch (err) { toast(err.message, "err"); }
+});
+
+async function loadAdmins() {
+  let list = [];
+  try { list = await api("GET", "/api/admins"); } catch (e) { return; }
+  const body = $("#admins-body");
+  body.innerHTML = list.length ? "" : '<tr><td colspan="3" class="muted">None — ADMIN_PASSWORD env var active (username "admin")</td></tr>';
+  for (const a of list) {
+    const tr = el("tr");
+    tr.innerHTML = `<td>${esc(a.username)}</td><td class="muted">${fmtTime(a.created_at)}</td>
+      <td><button class="danger" data-admin-del="${a.id}" data-name="${esc(a.username)}">Delete</button></td>`;
+    body.appendChild(tr);
+  }
+}
+
+$("#admins-body").addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-admin-del]");
+  if (!b) return;
+  const ok = await confirmModal(`Delete admin ${b.dataset.name}`, "<p>Their sessions stay valid until the cookie expires; new logins stop immediately.</p>", { danger: true, confirmText: "Delete" });
+  if (!ok) return;
+  try {
+    await api("DELETE", `/api/admins/${b.dataset.adminDel}`);
+    toast("Admin deleted");
+    loadAdmins();
+  } catch (err) { toast(err.message, "err"); }
+});
+
+$("#admin-add").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const f = e.target;
+  try {
+    await api("POST", "/api/admins", { username: f.username.value.trim(), password: f.password.value });
+    toast(`Admin ${f.username.value.trim()} created — the env password is now disabled`);
+    f.reset();
+    loadAdmins();
+  } catch (err) { toast(err.message, "err"); }
+});
+
+// Backup: fetch with credentials, then hand the bytes to the browser as a
+// download (an <a href> wouldn't send the POST).
+$("#backup-btn").addEventListener("click", async () => {
+  try {
+    const res = await fetch("/api/backup", { method: "POST", credentials: "same-origin" });
+    if (!res.ok) throw new Error((await res.json().catch(() => null) || {}).error || res.statusText);
+    const blob = await res.blob();
+    const a = el("a", { href: URL.createObjectURL(blob), download: `fleetdeck-backup-${new Date().toISOString().slice(0, 10)}.sqlite3` });
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    toast("Backup downloaded");
+  } catch (err) { toast(err.message, "err"); }
+});
+
+$("#restore-btn").addEventListener("click", (e) => { e.preventDefault(); $("#restore-file").click(); });
+$("#restore-file").addEventListener("change", async (e) => {
+  const file = e.target.files[0];
+  e.target.value = "";
+  if (!file) return;
+  const typed = await openModal({
+    title: "Restore from backup",
+    bodyHTML: `<p><b style="color:var(--red)">This replaces ALL current FleetDeck state</b> (clients, settings, audit history, sessions) with the contents of <span class="mono">${esc(file.name)}</span>. TrueNAS itself is not touched, but a backup that doesn't match reality will desync the dashboard until you reconcile.</p>`,
+    danger: true, confirmText: "Restore", typeToConfirm: "RESTORE FLEETDECK",
+  });
+  if (!typed) return;
+  try {
+    const res = await fetch("/api/restore?confirm=" + encodeURIComponent("RESTORE FLEETDECK"), {
+      method: "POST", credentials: "same-origin",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: await file.arrayBuffer(),
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok) throw new Error((data && data.error) || res.statusText);
+    toast("Restore complete — reloading");
+    setTimeout(() => location.reload(), 800);
+  } catch (err) { toast(err.message, "err"); }
+});
 $("#save-settings").addEventListener("click", async () => {
   const patch = {};
   for (const i of $$("#settings-grid input")) patch[i.dataset.key] = i.value;
@@ -1137,8 +1809,16 @@ $("#test-connection").addEventListener("click", async () => {
 
 /* ============================= Audit tab ================================ */
 
+// Severity from the action name: failures red, warnings amber, else default.
+function eventSeverity(action) {
+  const a = String(action || "");
+  if (/fail|error|rollback/i.test(a)) return "ev-error";
+  if (/warn|unknown/i.test(a)) return "ev-warn";
+  return "";
+}
+
 function eventRow(ev) {
-  const tr = el("tr");
+  const tr = el("tr", { className: eventSeverity(ev.action) });
   tr.innerHTML = `<td class="mono muted">${esc((ev.ts || "").toString().replace("T", " ").slice(0, 19))}</td>
     <td><span class="tag">${esc(ev.action)}</span></td><td>${esc(ev.client_id == null ? "—" : ev.client_id)}</td>
     <td class="muted">${esc(ev.actor || "—")}</td>
@@ -1156,17 +1836,39 @@ function prependEventRow(ev) {
   const [tr, detail] = eventRow(ev);
   body.insertBefore(detail, body.firstChild);
   body.insertBefore(tr, detail);
+  // Bound the live-tail DOM so a long-running tab doesn't grow unbounded.
+  while (body.children.length > 1000) body.removeChild(body.lastChild);
+}
+
+function auditQuery() {
+  const f = state.auditFilter;
+  const q = new URLSearchParams({ limit: "500" });
+  if (f.action) q.set("action", f.action);
+  if (f.from) q.set("from", new Date(f.from).toISOString());
+  if (f.to) { const d = new Date(f.to); d.setHours(23, 59, 59, 999); q.set("to", d.toISOString()); }
+  return q.toString();
 }
 
 async function loadEvents() {
   let list = [];
-  try { list = await api("GET", "/api/events"); } catch (e) { return; }
+  try { list = await api("GET", "/api/events?" + auditQuery()); } catch (e) { return; }
   const body = $("#events-body"); body.innerHTML = "";
   for (const ev of list) {
     const [tr, detail] = eventRow(ev);
     body.appendChild(tr); body.appendChild(detail);
   }
 }
+
+$("#audit-apply").addEventListener("click", () => {
+  state.auditFilter = { action: $("#audit-action").value.trim(), from: $("#audit-from").value, to: $("#audit-to").value };
+  loadEvents();
+});
+$("#audit-clear").addEventListener("click", () => {
+  state.auditFilter = { action: "", from: "", to: "" };
+  $("#audit-action").value = ""; $("#audit-from").value = ""; $("#audit-to").value = "";
+  loadEvents();
+});
+$("#audit-live").addEventListener("change", (e) => { state.auditLive = e.target.checked; });
 
 /* ========================== Command palette ============================= */
 
@@ -1258,7 +1960,7 @@ function switchView(v) {
   $("#sidebar").classList.remove("open");
   if (v === "golden") loadGolden();
   else if (v === "reconcile") loadReconcile();
-  else if (v === "setup") loadSetup();
+  else if (v === "setup") { loadSetup(); loadWizard(); }
   else if (v === "settings") loadSettings();
   else if (v === "events") loadEvents();
 }
@@ -1281,9 +1983,21 @@ $("#logout").addEventListener("click", async () => {
 $("#login-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   try {
-    await api("POST", "/api/auth/login", { password: e.target.password.value });
+    const body = { password: e.target.password.value };
+    const uname = e.target.username.value.trim();
+    if (uname) body.username = uname; // blank = legacy env-password login
+    await api("POST", "/api/auth/login", body);
     e.target.reset(); $("#login-msg").textContent = ""; boot();
-  } catch (err) { $("#login-msg").textContent = err.message === "unauthorized" ? "Wrong password" : err.message; }
+  } catch (err) { $("#login-msg").textContent = err.message === "unauthorized" ? "Wrong credentials" : err.message; }
+});
+
+// Audit export (item 34): JSON of the currently loaded events.
+$("#export-events").addEventListener("click", async () => {
+  try {
+    const list = await api("GET", "/api/events?limit=1000");
+    downloadBlob(`fleetdeck-audit-${new Date().toISOString().slice(0, 10)}.json`, "application/json", JSON.stringify(list, null, 2));
+    toast(`Exported ${list.length} events`);
+  } catch (err) { toast(err.message, "err"); }
 });
 
 let pollTimer = null;
@@ -1297,6 +2011,7 @@ async function boot() {
     showApp();
     state.clients = list;
     state.loadedClientsOnce = true;
+    try { state.clientErrors = await api("GET", "/api/client-errors"); } catch (e) {}
     try {
       const snaps = await api("GET", "/api/golden/snapshots");
       state.goldenNames = snaps.map((s) => s.name);
@@ -1304,8 +2019,19 @@ async function boot() {
         state.goldenNames.map((g) => `<option>${esc(g)}</option>`).join("");
     } catch (e) {}
     renderClients();
+    await loadPoolHistory();
     renderStatTiles(await loadPoolStatus());
     renderStamp();
+    // System info: DRY_RUN banner + build-provenance footer (items 48/49).
+    try {
+      const info = await api("GET", "/api/system/info");
+      state.dryRun = !!info.dryRun;
+      renderDryRunBanner();
+      if (info.gitCommit || info.buildDate) {
+        $("#build-stamp").textContent = [info.gitCommit ? info.gitCommit.slice(0, 8) : "", info.buildDate || ""].filter(Boolean).join(" · ");
+      }
+    } catch (e) {}
+    refreshConnHealth();
     loadDiscovered();
     connectWS();
     // Golden Build status is fetched globally (cheap) so the Golden-tab banner
@@ -1316,6 +2042,8 @@ async function boot() {
     // 1s countdown re-render (text only) while a session is active.
     if (!goldenBuildCountdown) goldenBuildCountdown = setInterval(() => {
       if (state.goldenBuild) renderGoldenBuildBanner();
+      // Live "retry in Ns" countdown on the connection dot while reconnecting.
+      if (state.connState && state.connState.state === "reconnecting") renderConnHealth();
     }, 1000);
     // Polling fallback: only fetch when the live channel is down; pool usage
     // (no WS message for it) still refreshes on a slow multiple of the tick.
@@ -1327,7 +2055,7 @@ async function boot() {
       if (!$("#dashboard").classList.contains("active")) return;
       tickCount += 1;
       if (!state.wsConnected) { loadClients(); loadDiscovered(); }
-      else if (tickCount % 6 === 0) loadPoolStatus().then(renderStatTiles);
+      else if (tickCount % 6 === 0) loadPoolHistory().then(() => loadPoolStatus().then(renderStatTiles));
     }, 10000);
   } catch (e) { /* 401 handled by api() -> showLogin */ }
 }

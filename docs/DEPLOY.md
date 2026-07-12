@@ -86,7 +86,9 @@ If this dataset doesn't exist, the safety-snapshot step fails closed (logged as 
 
 ## 2. First bring-up procedure
 
-Bring FleetDeck up in read-only mode before it's allowed to touch anything.
+Bring FleetDeck up in read-only mode before it's allowed to touch anything, then drive the whole TrueNAS-side setup from the **Setup tab** instead of clicking through the TrueNAS UI:
+
+The Setup tab's wizard checks and (with one confirmation each) creates: the client + `_safety` datasets, the golden zvol (sparse, 64K blocks, size prompt), iSCSI service enable+start, the portal (0.0.0.0:3260), an allow-all initiator group, the `win-golden` target **with portal groups** (an ungrouped target is unreachable — the wizard flags that exact misconfiguration), the device extent, and the LUN 0 mapping. Every step is idempotent and re-runnable: what already exists is reported, not re-created. With `DRY_RUN=1` each Create button shows the exact would-be RPC payloads and executes nothing — so you can walk the entire wizard in dry-run first and read precisely what it plans to do. Steps this TrueNAS build can't do over the API render as instructions for the TrueNAS UI, never as buttons that error. The manual steps (DHCP network boot, compiling `snponly.efi`) appear as checklist items with exact values prefilled — including a generated docker build command for `snponly.efi` with this instance's chain URL embedded, an upload button for a prebuilt binary, and a live "first boot request seen" indicator that proves the DHCP step worked. A re-runnable **Diagnostics** panel self-tests the whole chain: TrueNAS connection, golden zvol/target-groups, every boot file, a ranged HTTP self-fetch, and a real TFTP self-read.
 
 1. Start the app with **`DRY_RUN=1`**.
 2. Open the dashboard and log in with `ADMIN_PASSWORD`.
@@ -182,12 +184,21 @@ chain <winpe_chain_url>
 
 `<golden target>` is the last path segment of `GOLDEN_ZVOL` (e.g. `win-golden`); host and IQN prefix come from config/settings, same as normal client boot scripts.
 
-**Flow:**
+**Session phases.** A session starts in the `install` phase (armed MAC gets `sanhook` + chain into WinPE for imaging). After the deploy script finishes — image applied, `bcdboot` run — switch the session to `boot_installed` from the Golden-tab banner: the machine's next PXE boot gets a plain `sanboot` of the golden target and runs the freshly installed OS for OOBE/drivers/sysprep. This replaces the manual static-file override the old flow needed the moment the install finished. The banner shows the current phase, and switching back to `install` re-serves WinPE (e.g. to redo a failed apply).
 
-1. In Settings, set `winpe_chain_url`.
+**The generated deploy script.** `GET /boot/files/deploy.cmd` (also snapshotted into the SMB share at arm time) collapses the entire WinPE command marathon into one commented script: diskpart (GPT, 300 MB ESP → S:, MSR, NTFS → W:) with the target disk chosen by **typed number + typed confirmation** against a size hint from the real golden zvol — never a blind `select disk 0`; `dism /Get-WimInfo` then apply with `/SWMFile:` automatically when split `.swm` media was detected (Windows Setup silently cannot install from split images) and `/ScratchDir:W:\` always (the WinPE RAM-disk scratch caused real failures); `bcdboot W:\Windows /s S: /f UEFI`; offline `SYSTEM`-hive edits setting `Start=0` on `MSiSCSI`, `iScsiPrt`, and every NIC service from the `nic_boot_services` setting (only keys that exist — missing ones warn, they're not created) — the fix for post-install `INACCESSIBLE_BOOT_DEVICE`; and installation of the disk-offline safety script (`/boot/files/fleetdeck-safety.ps1` → `W:\FleetDeck\`) registered via a **RunOnce → schtasks** entry rather than offline TaskCache writes (offline task registration means hand-crafting undocumented registry blobs; RunOnce is deterministic across builds). `golden_image_index` (setting) pre-bakes the dism index; blank prompts in WinPE.
+
+**Fetching the script in WinPE:** SMB is the guaranteed transport (`net use M: \\<truenas-host>\fleetdeck-bootfiles && M:\deploy.cmd`) — PowerShell is an optional WinPE component (`WinPE-PowerShell`), present on most retail Setup media but not promised, so where it exists `powershell -c "iwr http://<fleetdeck-host>/boot/files/deploy.cmd -OutFile X:\d.cmd" && X:\d.cmd` is the one-liner alternative.
+
+**Flow** (mirrored as a tick-off checklist in the Golden-tab banner, persisted per session):
+
+1. In Settings, set `winpe_chain_url` (normally FleetDeck's own `/boot/files/winpe.ipxe`).
 2. On the Dashboard, in **Discovered clients**, click **Boot into Golden Build Mode** on the target machine's MAC and confirm the modal. (Arming performs no TrueNAS mutation — it only changes what FleetDeck serves next. It is intentionally **not** gated by `DRY_RUN`; see the note below.)
-3. PXE-boot that machine. It sanhooks onto `win-golden`, boots WinPE, and you service the image in place.
-4. When done, click **End session** in the amber banner on the **Golden** tab (or let it auto-expire). Then promote a new `gold-vN` from the Golden tab as usual.
+3. PXE-boot that machine. It sanhooks onto `win-golden` and boots WinPE.
+4. In WinPE, fetch and run the deploy script (commands above).
+5. Switch the session phase to `boot_installed`, reboot the machine, complete OOBE/drivers/software.
+6. Sysprep exactly `C:\Windows\System32\Sysprep\sysprep.exe /generalize /oobe /shutdown` (no `/mode:vm`), shut down.
+7. Click **End session** in the banner (or let it auto-expire). Then promote a new `gold-vN` from the Golden tab as usual.
 
 **Guardrails:**
 
@@ -196,3 +207,58 @@ chain <winpe_chain_url>
 - **`DRY_RUN` does not protect golden here.** `DRY_RUN=1` gates FleetDeck-initiated TrueNAS mutations (clone/create/delete); it does not gate boot-script serving, and Golden Build Mode is a serving change. An armed machine can therefore write to golden even under `DRY_RUN=1`. The real safety mechanisms are the single-session invariant, the golden-target session check, and the confirmation modal — not `DRY_RUN`.
 
 **Fallback.** The old manual method (a static per-MAC `.ipxe` file dropped into the `ipxeboot` server's `http/boot/`) still works if you ever need it, but it is no longer the documented primary path.
+
+---
+
+## 6. Guest-fleet features
+
+**Safety-script heartbeat contract.** The golden image's disk-offline scheduled task should, at startup, POST to FleetDeck (unauthenticated — the machine has no credentials at boot):
+
+```
+POST http://<fleetdeck-host>:<port>/boot/<mac-with-dashes-or-colons>/heartbeat
+Content-Type: application/json
+
+{"safety_script_ran": true}
+```
+
+e.g. from the safety `.ps1`: `Invoke-RestMethod -Method Post -Uri "http://192.168.1.36:8080/boot/$((Get-NetAdapter | Select -First 1).MacAddress)/heartbeat" -Body '{"safety_script_ran":true}' -ContentType 'application/json'`. FleetDeck stamps `last_heartbeat_at`; a booted client whose heartbeat hasn't arrived since its last boot gets a **"no heartbeat"** warning badge (the safety script may not have run). The generated `fleetdeck-safety.ps1` is a good place to add this call when you extend it.
+
+**Guest idle timeout.** `guest_idle_timeout_minutes` (Settings; 0 = disabled) reclaims machines whose session has been active longer than the limit, via a forced reset. **Limitation, stated plainly:** TrueNAS exposes no per-session idle/last-activity metric, so this enforces total session *duration*, not true idleness. Each session is reset at most once (the iSCSI session can outlive the reset until the machine reboots).
+
+**Public status page.** `GET /status` is intentionally unauthenticated and strictly minimal: machine display names + available/in-use, plus the `guest_motd` banner (Settings). No MACs, zvols, or other detail — it's the walk-up "which machine is free" board. This and `/boot/*` are the only unauthenticated data-bearing routes.
+
+**Kick.** The TrueNAS API cannot terminate a specific iSCSI session (there is no such RPC in v25.10), so the drawer's "Kick" is labeled and implemented as a **forced reset**: the disk is wiped and re-cloned under the live session; the machine keeps running from cache until it reboots.
+
+**QR stickers.** Each client's detail drawer offers a print-friendly QR (generated server-side with the pure-JS `qrcode` package) linking to the static `/troubleshoot.html` guest help page.
+
+---
+
+## 7. Fleet operations
+
+**Tags & per-tag maintenance.** Clients carry comma-separated `tags` (edited in the detail drawer); the dashboard shows filter chips, and the Settings tab has **maintenance windows** — per-tag cron schedules with a `reset` or `wake` action, run by the scheduler alongside the global nightly cron (blank tag = whole fleet; scheduled resets always force). **Wake all** and CSV/JSON **exports** (client table, Audit tab) are also on those tabs; exports generate client-side from already-loaded data.
+
+**Webhooks.** Set `webhook_url` and `webhook_events` (comma-separated: `pool_warning`, `reset_failed`, `nightly_summary`). FleetDeck POSTs a generic `{event, ts, ...data}` JSON body — not Discord/Slack-specific, so it works with either via their incoming-webhook adapters. To send a formatted Discord/Slack embed, point `webhook_url` at a small relay that reshapes this payload.
+
+**Monitoring.** `GET /healthz` (unauthenticated, `{ok, truenas, dryRun}`) for uptime checks; `GET /metrics` (unauthenticated, Prometheus text) exposes `fleetdeck_clients_total`, `_clients_booted`, `_truenas_connected`, `_dry_run`, `_pool_used_percent` — counts and state only, no identities. The dashboard's pool-used tile shows a sparkline from the `pool_history` series the pool monitor records every 5 minutes.
+
+**Update check.** FleetDeck checks the latest GitHub release tag once a day and shows an "update available" badge in Settings. No auto-update — updates stay manual.
+
+**Multiple admins.** The Settings tab manages named local accounts (scrypt-hashed). While the `admins` table is empty, the `ADMIN_PASSWORD` env var logs in as `admin` (existing deployments are untouched); once any named account exists, only those accounts work, the login form's username field is required, and the last account can't be deleted (lockout guard). `session_timeout_minutes` (default 720) sets the cookie lifetime, replacing the old hardcoded 12h.
+
+**Backup / restore.** Settings → **Download backup** streams a consistent `VACUUM INTO` copy of the SQLite state (not the live file). **Restore** validates the upload is a compatible FleetDeck database, then replaces every table on the live connection inside one transaction (so no restart is needed); it requires typing `RESTORE FLEETDECK` to confirm. Boot files are not part of the backup.
+
+**API-key rotation.** TrueNAS doesn't expose API-key creation dates, so set `api_key_created_at` (e.g. `2026-07-01`) when you create/rotate the key; Settings shows a banner once it exceeds `api_key_max_age_days` (default 180).
+
+**Build provenance.** `GIT_COMMIT` and `BUILD_DATE` (Docker build args, baked to env) show in Settings and `/api/system/info`.
+
+---
+
+## 8. Reliability & observability
+
+- **Live audit tail**: the Audit tab streams new events over the WebSocket with severity coloring (failures red, warnings amber), plus server-side filters (action prefix, date range) so large histories filter on the server, not the browser.
+- **Connection health**: a dot in the sidebar (visible on every tab) shows the TrueNAS connection — green connected, amber *reconnecting* with the attempt count and a live "retry in Ns" countdown (so a recovering box reads as recovering, not broken), red down.
+- **Per-client last error**: a ⚠ icon on each dashboard row surfaces that client's most recent failed audit event on hover, instead of it being buried in the Audit tab.
+- **Self-test**: Settings → *Run self-test* re-runs the same checks as the Setup-tab Diagnostics (TrueNAS connectivity, golden zvol/target groups, `_safety`, boot files, ranged HTTP self-fetch, TFTP self-read).
+- **Config warnings**: Settings surfaces recommended-but-unset configuration (no webhook, API-key age tracking off, WoL broadcast mismatch, DRY_RUN armed) instead of leaving it to the console at boot.
+- **DRY_RUN banner**: a persistent, high-contrast banner rides above every tab whenever `DRY_RUN=1`.
+- **What's new**: `CHANGELOG.md` is parsed into a Settings panel with a per-admin unread indicator (last-seen version stored on the account, so it follows the operator across machines rather than relying on browser storage).

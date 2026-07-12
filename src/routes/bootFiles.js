@@ -4,6 +4,7 @@ const express = require('express');
 const {
   bootDirs, bootFilesStatus, generateWinpeIpxe, downloadWimboot, bootActivity,
 } = require('../services/bootFiles');
+const { generateDeployCmd, generateSafetyPs1 } = require('../services/deployScript');
 const { getSetting, logEvent } = require('../db');
 
 // Base URL for the boot chain as seen BY THE BOOTING CLIENT. Derived from the
@@ -40,6 +41,35 @@ function createBootFilesRouter(ctx) {
       console.error('winpe.ipxe generation error:', err);
       return res.status(200).send('#!ipxe\necho FleetDeck internal error generating winpe.ipxe\nshell\n');
     }
+  });
+
+  // Generated WinPE-side automation. Registered BEFORE the static handler so
+  // the live-generated versions win over the on-disk snapshots (written for
+  // the SMB share at arm time). Same unauthenticated trust boundary as the
+  // rest of /boot/* — WinPE can't log in either.
+  router.get('/boot/files/deploy.cmd', async (req, res) => {
+    res.set('Content-Type', 'text/plain');
+    try {
+      // Golden zvol size, when reachable, becomes the disk-picker hint.
+      let goldenSizeGib = null;
+      if (ctx.adapter) {
+        try {
+          const ds = await ctx.adapter.queryDataset(ctx.config.goldenZvol);
+          const volsize = ds && ds.volsize && (ds.volsize.parsed != null ? ds.volsize.parsed : ds.volsize);
+          if (typeof volsize === 'number') goldenSizeGib = Math.round(volsize / (1024 ** 3));
+        } catch (_) { /* hint only; generation must not depend on TrueNAS */ }
+      }
+      logEvent(ctx.db, { action: 'boot.deploy_cmd_serve' });
+      return res.status(200).send(generateDeployCmd({ ctx, baseUrl: baseUrlFrom(req), goldenSizeGib }));
+    } catch (err) {
+      console.error('deploy.cmd generation error:', err);
+      return res.status(200).send('rem FleetDeck internal error generating deploy.cmd\r\n');
+    }
+  });
+
+  router.get('/boot/files/fleetdeck-safety.ps1', (req, res) => {
+    res.set('Content-Type', 'text/plain');
+    return res.status(200).send(generateSafetyPs1());
   });
 
   // Static boot assets (wimboot, WinPE media). express.static rides on the

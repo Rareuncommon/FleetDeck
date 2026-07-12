@@ -4,6 +4,7 @@ const {
   getSetting,
   getActiveGoldenBuildSession,
   insertGoldenBuildSession,
+  updateGoldenBuildSession,
   closeActiveGoldenBuildSession,
   closeExpiredGoldenBuildSessions,
   logEvent,
@@ -136,7 +137,56 @@ function expireGoldenBuild(ctx) {
   return expired;
 }
 
+// Guided-workflow phases. 'install' serves sanhook + WinPE (imaging);
+// 'boot_installed' serves a plain sanboot of the golden target (running the
+// freshly installed OS for OOBE/drivers/sysprep). The operator switches after
+// the deploy script's NEXT STEPS say to.
+const PHASES = ['install', 'boot_installed'];
+
+function setGoldenBuildPhase(ctx, phase) {
+  if (!PHASES.includes(phase)) {
+    throw new Error(`Unknown golden build phase "${phase}" (expected ${PHASES.join(' | ')})`);
+  }
+  const active = getActiveGoldenBuildSession(ctx.db);
+  if (!active) throw new Error('No active golden build session');
+  if (active.phase === phase) return active; // idempotent
+  updateGoldenBuildSession(ctx.db, active.id, { phase });
+  logEvent(ctx.db, {
+    action: 'golden_build.phase_changed',
+    after: { session_id: active.id, mac: active.mac, from: active.phase, to: phase },
+  });
+  return { ...active, phase };
+}
+
+// The guided checklist mirrored by the Golden tab while a session is active.
+// Steps FleetDeck can't perform are instructions, not buttons — the operator
+// ticks them off manually and the state persists on the session row.
+const CHECKLIST = [
+  { id: 'boot_winpe', label: 'PXE-boot the armed machine — it lands in WinPE via the golden-build script' },
+  { id: 'run_deploy', label: 'In WinPE: map the media share and run deploy.cmd (commands shown below)' },
+  { id: 'switch_phase', label: 'Switch the session phase to boot_installed (button above)' },
+  { id: 'sanboot', label: 'Reboot the machine — it now sanboots the installed OS from the golden zvol' },
+  { id: 'oobe', label: 'Complete OOBE; install drivers and software' },
+  { id: 'sysprep', label: 'Run sysprep exactly: C:\\Windows\\System32\\Sysprep\\sysprep.exe /generalize /oobe /shutdown  (no /mode:vm)' },
+  { id: 'end_session', label: 'After it shuts down: End the session' },
+  { id: 'promote', label: 'Promote the new golden version (Golden tab)' },
+];
+
+function setChecklistStep(ctx, stepId, done) {
+  if (!CHECKLIST.some((s) => s.id === stepId)) {
+    throw new Error(`Unknown checklist step "${stepId}"`);
+  }
+  const active = getActiveGoldenBuildSession(ctx.db);
+  if (!active) throw new Error('No active golden build session');
+  let state = {};
+  try { state = JSON.parse(active.checklist_json || '{}'); } catch (_) { state = {}; }
+  state[stepId] = !!done;
+  updateGoldenBuildSession(ctx.db, active.id, { checklist_json: JSON.stringify(state) });
+  return { ...active, checklist_json: JSON.stringify(state) };
+}
+
 module.exports = {
   armGoldenBuild, endGoldenBuild, expireGoldenBuild, goldenTargetHasSession,
+  setGoldenBuildPhase, setChecklistStep, PHASES, CHECKLIST,
   DEFAULT_DURATION_MINUTES,
 };

@@ -16,7 +16,7 @@ changes.setMaxListeners(20);
 const CLIENT_COLUMNS = [
   'name', 'mac', 'zvol', 'target_name', 'golden_snapshot', 'raw_override',
   'boot_golden_once', 'nightly_reset', 'status', 'space_used_bytes',
-  'notes', 'last_boot_at',
+  'notes', 'last_boot_at', 'gpu_vendor', 'last_heartbeat_at', 'tags',
 ];
 
 function initDb(dbPath) {
@@ -26,6 +26,36 @@ function initDb(dbPath) {
   db.pragma('journal_mode = WAL');
   const schema = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8');
   db.exec(schema);
+  // Minimal in-place migrations: CREATE TABLE IF NOT EXISTS never alters an
+  // existing table, so columns added after a table shipped must be ALTERed
+  // in for databases created before them. ADD COLUMN with a DEFAULT is safe
+  // and instant in SQLite; guarded by a pragma check so it's idempotent.
+  const gbCols = new Set(db.pragma('table_info(golden_build_sessions)').map((c) => c.name));
+  if (!gbCols.has('phase')) {
+    db.exec("ALTER TABLE golden_build_sessions ADD COLUMN phase TEXT NOT NULL DEFAULT 'install'");
+  }
+  if (!gbCols.has('checklist_json')) {
+    db.exec('ALTER TABLE golden_build_sessions ADD COLUMN checklist_json TEXT');
+  }
+  const clientCols = new Set(db.pragma('table_info(clients)').map((c) => c.name));
+  // gpu_vendor: 'amd' | 'nvidia' | 'intel' | 'unknown' | NULL. Set manually
+  // in the detail drawer for now; auto-detection would need the heartbeat
+  // payload extended with GPU info — deliberately not built until wanted.
+  if (!clientCols.has('gpu_vendor')) {
+    db.exec('ALTER TABLE clients ADD COLUMN gpu_vendor TEXT');
+  }
+  // Last time the golden image's safety-script heartbeat POSTed for this MAC;
+  // a booted client without a recent heartbeat gets a warning badge (the
+  // disk-offline safety script may not have run).
+  if (!clientCols.has('last_heartbeat_at')) {
+    db.exec('ALTER TABLE clients ADD COLUMN last_heartbeat_at TEXT');
+  }
+  // tags: comma-separated TEXT rather than a join table — least disruptive
+  // to the existing queries (everything reads whole client rows), and fleet
+  // sizes here make LIKE-free in-app filtering trivial.
+  if (!clientCols.has('tags')) {
+    db.exec('ALTER TABLE clients ADD COLUMN tags TEXT');
+  }
   return db;
 }
 
@@ -131,14 +161,40 @@ function logEvent(db, { action, clientId = null, before = null, after = null, ac
 }
 
 // clientId filter powers the per-client audit history in the dashboard's
-// detail drawer; the unfiltered form remains the Audit tab's full feed.
-function listEvents(db, { limit = 100, clientId = null } = {}) {
-  if (clientId != null) {
-    return db.prepare(
-      'SELECT * FROM events WHERE client_id = ? ORDER BY id DESC LIMIT ?'
-    ).all(clientId, limit);
-  }
-  return db.prepare('SELECT * FROM events ORDER BY id DESC LIMIT ?').all(limit);
+// detail drawer; the other filters power the Audit tab's server-side query
+// (item 44) since audit history can grow past what's sane to filter client-
+// side. `action` matches a prefix ("client." catches all client events);
+// from/to are ISO timestamps compared against the ts column.
+function listEvents(db, { limit = 100, clientId = null, action = null, from = null, to = null } = {}) {
+  const where = [];
+  const params = [];
+  if (clientId != null) { where.push('client_id = ?'); params.push(clientId); }
+  if (action) { where.push('action LIKE ?'); params.push(`${action}%`); }
+  if (from) { where.push('ts >= ?'); params.push(from); }
+  if (to) { where.push('ts <= ?'); params.push(to); }
+  const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  params.push(limit);
+  return db.prepare(`SELECT * FROM events ${clause} ORDER BY id DESC LIMIT ?`).all(...params);
+}
+
+// Most recent failure-ish audit event per client, for the inline last-error
+// icon on each dashboard row (item 45). "Failure-ish" = action contains
+// fail/error/rollback. One row per client via a correlated MAX(id).
+function latestErrorPerClient(db) {
+  const rows = db.prepare(
+    `SELECT e.client_id, e.action, e.ts, e.after_json
+       FROM events e
+       WHERE e.client_id IS NOT NULL
+         AND (e.action LIKE '%fail%' OR e.action LIKE '%error%' OR e.action LIKE '%rollback%')
+         AND e.id = (
+           SELECT MAX(e2.id) FROM events e2
+           WHERE e2.client_id = e.client_id
+             AND (e2.action LIKE '%fail%' OR e2.action LIKE '%error%' OR e2.action LIKE '%rollback%')
+         )`
+  ).all();
+  const out = {};
+  for (const r of rows) out[r.client_id] = { action: r.action, ts: r.ts, after: r.after_json };
+  return out;
 }
 
 // The events table has no other retention policy and /boot/* (unauthenticated,
@@ -184,6 +240,125 @@ function deleteSafetySnapshotRecord(db, id) {
   db.prepare('DELETE FROM safety_snapshots WHERE id = ?').run(id);
 }
 
+// --- Client iSCSI session history -------------------------------------------
+
+function getOpenSession(db, clientId) {
+  return db.prepare(
+    'SELECT * FROM sessions WHERE client_id = ? AND ended_at IS NULL ORDER BY id DESC LIMIT 1'
+  ).get(clientId) || null;
+}
+
+function openSession(db, clientId) {
+  const info = db.prepare('INSERT INTO sessions (client_id) VALUES (?)').run(clientId);
+  return info.lastInsertRowid;
+}
+
+function closeSession(db, sessionId) {
+  // duration computed in SQL from the row's own started_at so clock math
+  // stays in one place and one timezone (UTC ISO strings throughout).
+  db.prepare(
+    `UPDATE sessions SET
+       ended_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+       duration_seconds = CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER)
+     WHERE id = ? AND ended_at IS NULL`
+  ).run(sessionId);
+}
+
+function markSessionIdleReset(db, sessionId) {
+  db.prepare(
+    "UPDATE sessions SET idle_reset_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?"
+  ).run(sessionId);
+}
+
+function listClientSessions(db, clientId, { limit = 50 } = {}) {
+  return db.prepare(
+    'SELECT * FROM sessions WHERE client_id = ? ORDER BY id DESC LIMIT ?'
+  ).all(clientId, limit);
+}
+
+// --- Maintenance windows -------------------------------------------------------
+
+function listMaintenanceWindows(db) {
+  return db.prepare('SELECT * FROM maintenance_windows ORDER BY id').all();
+}
+
+function insertMaintenanceWindow(db, { tag = '', cron, action = 'reset' }) {
+  const info = db.prepare(
+    'INSERT INTO maintenance_windows (tag, cron, action) VALUES (?, ?, ?)'
+  ).run(tag, cron, action);
+  return info.lastInsertRowid;
+}
+
+function deleteMaintenanceWindow(db, id) {
+  db.prepare('DELETE FROM maintenance_windows WHERE id = ?').run(id);
+}
+
+// --- Admin accounts --------------------------------------------------------------
+
+function listAdmins(db) {
+  return db.prepare('SELECT id, username, last_seen_version, created_at FROM admins ORDER BY id').all();
+}
+
+function getAdminByUsername(db, username) {
+  return db.prepare('SELECT * FROM admins WHERE username = ?').get(username) || null;
+}
+
+function insertAdmin(db, { username, passwordHash }) {
+  const info = db.prepare('INSERT INTO admins (username, password_hash) VALUES (?, ?)').run(username, passwordHash);
+  return info.lastInsertRowid;
+}
+
+function deleteAdmin(db, id) {
+  db.prepare('DELETE FROM admins WHERE id = ?').run(id);
+}
+
+function countAdmins(db) {
+  return db.prepare('SELECT COUNT(*) AS n FROM admins').get().n;
+}
+
+function setAdminLastSeenVersion(db, username, version) {
+  db.prepare('UPDATE admins SET last_seen_version = ? WHERE username = ?').run(version, username);
+}
+
+// --- Pool capacity history --------------------------------------------------------
+
+function insertPoolHistory(db, usedPercent) {
+  db.prepare('INSERT INTO pool_history (used_percent) VALUES (?)').run(usedPercent);
+  // Bounded: ~2000 points ≈ a week at 5-minute intervals; prune the tail so
+  // the table can't grow without limit on a box that runs for years.
+  db.prepare(
+    'DELETE FROM pool_history WHERE id <= (SELECT MAX(id) FROM pool_history) - 2000'
+  ).run();
+}
+
+function lastPoolHistoryAt(db) {
+  const row = db.prepare('SELECT ts FROM pool_history ORDER BY id DESC LIMIT 1').get();
+  return row ? row.ts : null;
+}
+
+function listPoolHistory(db, { limit = 288 } = {}) {
+  return db.prepare(
+    'SELECT ts, used_percent FROM (SELECT * FROM pool_history ORDER BY id DESC LIMIT ?) ORDER BY id'
+  ).all(limit);
+}
+
+// --- Hardware gap reports -----------------------------------------------------
+
+function insertHardwareGap(db, { clientId = null, mac = null, description, source = 'manual' }) {
+  const info = db.prepare(
+    'INSERT INTO discovered_hardware_gaps (client_id, mac, description, source) VALUES (?, ?, ?, ?)'
+  ).run(clientId, mac, description, source);
+  return info.lastInsertRowid;
+}
+
+function listHardwareGaps(db) {
+  return db.prepare('SELECT * FROM discovered_hardware_gaps ORDER BY id DESC').all();
+}
+
+function deleteHardwareGap(db, id) {
+  db.prepare('DELETE FROM discovered_hardware_gaps WHERE id = ?').run(id);
+}
+
 // --- Golden Build Mode sessions -------------------------------------------
 // Invariant: at most one row with ended_at IS NULL, ever. Enforced here (not
 // by a DB constraint) so the same query can drive the UI's disabled state.
@@ -217,6 +392,19 @@ function insertGoldenBuildSession(db, { mac, startedAt, expiresAt }) {
     return db.prepare('SELECT * FROM golden_build_sessions WHERE id = ?').get(info.lastInsertRowid);
   });
   return tx();
+}
+
+// Column-whitelisted update for the active-session workflow fields (phase
+// switches, checklist progress). Only ever touches the given row.
+const GOLDEN_BUILD_MUTABLE = ['phase', 'checklist_json'];
+
+function updateGoldenBuildSession(db, id, fields) {
+  const keys = Object.keys(fields).filter((k) => GOLDEN_BUILD_MUTABLE.includes(k));
+  if (keys.length === 0) return;
+  const assignments = keys.map((k) => `${k} = @${k}`).join(', ');
+  const params = { id };
+  for (const k of keys) params[k] = fields[k];
+  db.prepare(`UPDATE golden_build_sessions SET ${assignments} WHERE id = @id`).run(params);
 }
 
 // Ends the current active session (if any). Idempotent: returns null and does
@@ -254,6 +442,13 @@ module.exports = {
   upsertDiscovered, listDiscovered, removeDiscovered,
   insertSafetySnapshot, listExpiredSafetySnapshots, deleteSafetySnapshotRecord,
   getActiveGoldenBuildSession, insertGoldenBuildSession,
+  updateGoldenBuildSession,
   closeActiveGoldenBuildSession, closeExpiredGoldenBuildSessions,
+  getOpenSession, openSession, closeSession, markSessionIdleReset, listClientSessions,
+  insertHardwareGap, listHardwareGaps, deleteHardwareGap,
+  listMaintenanceWindows, insertMaintenanceWindow, deleteMaintenanceWindow,
+  listAdmins, getAdminByUsername, insertAdmin, deleteAdmin, countAdmins, setAdminLastSeenVersion,
+  insertPoolHistory, lastPoolHistoryAt, listPoolHistory,
+  latestErrorPerClient,
   changes,
 };

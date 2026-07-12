@@ -173,4 +173,43 @@ function startTftpServer({ root, port = 69, host = '0.0.0.0', onRead = null }) {
   });
 }
 
-module.exports = { startTftpServer };
+// Minimal TFTP read client, used by the diagnostics panel to prove the
+// in-process server actually answers (a self-test read of snponly.efi) —
+// the honest version of "TFTP is configured".
+function tftpFetch({ host = '127.0.0.1', port = 69, filename, timeoutMs = 4000 }) {
+  return new Promise((resolve, reject) => {
+    const sock = dgram.createSocket('udp4');
+    const chunks = [];
+    let finished = false;
+    const finish = (err, data) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      try { sock.close(); } catch (_) { /* already closed */ }
+      if (err) reject(err); else resolve(data);
+    };
+    const timer = setTimeout(() => finish(new Error('TFTP self-test timed out')), timeoutMs);
+
+    sock.on('message', (msg, rinfo) => {
+      if (msg.length < 4) return;
+      const op = msg.readUInt16BE(0);
+      if (op === OP.ERROR) {
+        return finish(new Error(`TFTP error: ${msg.subarray(4, msg.length - 1).toString('ascii')}`));
+      }
+      if (op === OP.DATA) {
+        const block = msg.readUInt16BE(2);
+        chunks.push(msg.subarray(4));
+        const ack = Buffer.alloc(4);
+        ack.writeUInt16BE(OP.ACK, 0);
+        ack.writeUInt16BE(block, 2);
+        sock.send(ack, rinfo.port, rinfo.address);
+        if (msg.length - 4 < 512) finish(null, Buffer.concat(chunks));
+      }
+    });
+    sock.on('error', finish);
+    const rrq = Buffer.concat([Buffer.from([0, OP.RRQ]), Buffer.from(`${filename}\0octet\0`, 'ascii')]);
+    sock.send(rrq, port, host);
+  });
+}
+
+module.exports = { startTftpServer, tftpFetch };

@@ -20,6 +20,11 @@ const { createReconcileRouter } = require('./routes/reconcile');
 const { createBulkImportRouter } = require('./routes/bulkImport');
 const { createGoldenBuildRouter } = require('./routes/goldenBuild');
 const { createBootFilesRouter } = require('./routes/bootFiles');
+const { createSetupRouter } = require('./routes/setup');
+const { createGuestRouter } = require('./routes/guest');
+const { createSystemRouter } = require('./routes/system');
+const { createFleetOpsRouter } = require('./routes/fleetOps');
+const { startUpdateCheck } = require('./services/updateCheck');
 const { ensureBootDirs, recordBootActivity } = require('./services/bootFiles');
 const { startTftpServer } = require('./services/tftp');
 const { createTrueNasStatusRouter } = require('./routes/truenas');
@@ -76,42 +81,48 @@ function startReconnectLoop(ctx, holder) {
   let backoffMs = RECONNECT_MIN_MS;
   let stopped = false;
   let timer = null;
+  let attemptCount = 0;
 
-  // ctx.push is attached after app.listen(), later than this loop starts —
-  // read it live and tolerate its absence (an early state change before the
-  // channel exists has no tabs to tell anyway; each new socket is greeted
-  // with the current state on connect).
-  function pushState(connected) {
-    if (ctx.push) ctx.push.broadcast('truenas', { connected });
+  // Connection state surfaced to the UI (item 42/43): the sidebar health dot
+  // distinguishes "connected" (green), "reconnecting" (yellow, with attempt
+  // count + next-retry countdown so a recovering box reads as recovering,
+  // not broken) and "down". Read live off ctx by /api/system/connection and
+  // pushed on every transition.
+  function setConn(state, extra = {}) {
+    ctx.connState = { state, attempt: attemptCount, ...extra };
+    if (ctx.push) ctx.push.broadcast('truenas', { connected: state === 'connected', ...ctx.connState });
   }
+  ctx.connState = { state: ctx.adapter ? 'connected' : 'reconnecting', attempt: 0 };
 
   function onDisconnected() {
     if (stopped) return;
     console.error('[server] TrueNAS connection dropped; will retry with backoff');
     ctx.adapter = null;
-    pushState(false);
     scheduleAttempt();
   }
 
   async function attempt() {
     if (stopped) return;
+    attemptCount += 1;
     try {
       const { client, adapter } = await connectTrueNAS(ctx.config);
       holder.client = client;
       ctx.adapter = adapter;
       backoffMs = RECONNECT_MIN_MS;
+      attemptCount = 0;
       console.log('[server] TrueNAS (re)connected and resolved RPC methods');
-      pushState(true);
+      setConn('connected');
       client.on('disconnected', onDisconnected);
     } catch (err) {
       console.error(`[server] TrueNAS reconnect attempt failed: ${err.message}`);
-      scheduleAttempt();
+      scheduleAttempt(err.message);
     }
   }
 
-  function scheduleAttempt() {
+  function scheduleAttempt(lastError = null) {
     if (stopped) return;
     clearTimeout(timer);
+    setConn('reconnecting', { nextRetryAt: new Date(Date.now() + backoffMs).toISOString(), lastError });
     timer = setTimeout(attempt, backoffMs);
     backoffMs = Math.min(backoffMs * 2, RECONNECT_MAX_MS);
   }
@@ -176,7 +187,7 @@ async function main() {
   app.use(createBootRouter(ctx));
 
   // Also unauthenticated: you can't require a session cookie to obtain one.
-  app.use(createAuthRouter({ adminPassword: config.adminPassword, cookieSecret: config.cookieSecret }));
+  app.use(createAuthRouter(ctx));
 
   // Static frontend shell is served without auth — it's just the SPA's HTML/JS/CSS.
   // The page's own JS hits the API, gets 401, and shows its login form. `app.use`
@@ -193,6 +204,16 @@ async function main() {
   app.use(createReconcileRouter(ctx));
   app.use(createBulkImportRouter(ctx));
   app.use(createGoldenBuildRouter(ctx));
+  app.use(createSetupRouter(ctx));
+  // Registered after the /api auth middleware so its /api/* routes are
+  // protected; its public GET /status is NOT under /api, so the auth scope
+  // never touches it — that page is unauthenticated by design (see
+  // routes/guest.js for the trust-boundary rationale).
+  app.use(createGuestRouter(ctx));
+  // Same split as the guest router: /healthz + /metrics are unauthenticated
+  // monitoring endpoints (not under /api); /api/system/* stays protected.
+  app.use(createSystemRouter(ctx));
+  app.use(createFleetOpsRouter(ctx));
   app.use(createTrueNasStatusRouter(ctx));
 
   app.get('/api/events', (req, res) => {
@@ -217,7 +238,11 @@ async function main() {
         }
         clientId = parsed;
       }
-      return res.status(200).json(listEvents(db, { limit, clientId }));
+      // Audit-tab server-side filters (item 44): action prefix + date range.
+      const action = typeof req.query.action === 'string' && req.query.action ? req.query.action : null;
+      const from = typeof req.query.from === 'string' && req.query.from ? req.query.from : null;
+      const to = typeof req.query.to === 'string' && req.query.to ? req.query.to : null;
+      return res.status(200).json(listEvents(db, { limit, clientId, action, from, to }));
     } catch (err) {
       return res.status(500).json({ error: err.message });
     }
@@ -228,10 +253,15 @@ async function main() {
   // Read live per-request by the settings route, not destructured at startup,
   // so a later settings change can still trigger a reschedule.
   ctx.rescheduleCron = scheduler.reschedule;
+  // Maintenance-window CRUD routes call this so cron edits apply live.
+  ctx.rescheduleWindows = scheduler.rescheduleWindows;
 
   // Attached to ctx (not captured by routes/pool.js at construction time) so
   // GET /api/pool/status can read the latest reading on every request.
   ctx.poolMonitor = startPoolMonitor(ctx);
+
+  // Daily latest-release check for the Settings "update available" badge.
+  const updateCheck = startUpdateCheck(ctx);
 
   const server = app.listen(config.httpPort, config.httpBind, () => {
     console.log(
@@ -257,6 +287,7 @@ async function main() {
         port: config.tftpPort,
         onRead: (filename) => recordBootActivity(db, 'tftp', filename),
       });
+      ctx.tftp = tftp; // diagnostics self-test reads through the live server
       console.log(`[server] TFTP serving ${bootDirs.tftp} on udp/${tftp.port}`);
     } catch (err) {
       console.error(
@@ -273,6 +304,7 @@ async function main() {
     scheduler.stop();
     if (ctx.poolMonitor) ctx.poolMonitor.stop();
     if (ctx.push) ctx.push.stop();
+    if (updateCheck) updateCheck.stop();
     if (tftp) tftp.close();
     server.close();
     if (holder.client) {

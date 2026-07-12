@@ -68,12 +68,13 @@ function createPushChannel(server, ctx) {
     ws.isAlive = true;
     ws.on('pong', () => { ws.isAlive = true; });
     ws.on('error', () => { /* reaper terminates; don't crash the process */ });
-    // Greet with the current adapter state so a fresh tab shows connection
-    // status immediately instead of waiting for the next transition.
+    // Greet with the current adapter + reconnect state so a fresh tab shows
+    // connection status immediately (including "reconnecting" with attempt/
+    // next-retry) instead of waiting for the next transition.
     try {
       ws.send(JSON.stringify({
         type: 'truenas',
-        payload: { connected: !!ctx.adapter },
+        payload: { connected: !!ctx.adapter, ...(ctx.connState || {}) },
         ts: new Date().toISOString(),
       }));
     } catch (_) { /* socket died mid-handshake */ }

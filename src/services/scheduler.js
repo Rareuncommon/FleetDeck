@@ -2,8 +2,17 @@ const cron = require('node-cron');
 const {
   listClients, getSetting, logEvent, pruneEvents,
   listExpiredSafetySnapshots, deleteSafetySnapshotRecord,
+  listMaintenanceWindows,
 } = require('../db');
 const { resetClient } = require('./clientOps');
+const { sendWakeOnLan } = require('./wol');
+const { fireWebhook } = require('./webhook');
+
+function clientHasTag(client, tag) {
+  if (!tag) return true; // '' = every client
+  const tags = String(client.tags || '').split(',').map((s) => s.trim()).filter(Boolean);
+  return tags.includes(tag);
+}
 
 const DEFAULT_CRON = '0 4 * * *';
 
@@ -24,6 +33,10 @@ async function runNightlyReset(ctx) {
         clientId: client.id,
         after: { error: err && err.message ? err.message : String(err) },
       });
+      fireWebhook(ctx, 'reset_failed', {
+        client: client.name,
+        error: err && err.message ? err.message : String(err),
+      });
     }
   }
 
@@ -31,6 +44,7 @@ async function runNightlyReset(ctx) {
     action: 'scheduler.nightly_reset',
     after: { count: clients.length, failures },
   });
+  fireWebhook(ctx, 'nightly_summary', { count: clients.length, failures });
 
   // The events table has no other retention policy; ride along on the same
   // nightly fire rather than adding a second timer for this.
@@ -65,31 +79,82 @@ function resolveCronExpr(ctx) {
   return cronExpr;
 }
 
-function startScheduler(ctx) {
-  let task = cron.schedule(resolveCronExpr(ctx), () => {
-    runNightlyReset(ctx).catch((err) => {
-      console.error('[scheduler] nightly reset run crashed:', err);
-    });
+// Per-tag maintenance windows (item 29): each row is its own cron. 'reset'
+// force-resets tagged clients sequentially (same rule as the nightly run:
+// scheduled maintenance always forces); 'wake' sends WoL to them.
+async function runMaintenanceWindow(ctx, window) {
+  const clients = listClients(ctx.db).filter((c) => clientHasTag(c, window.tag));
+  let failures = 0;
+  if (window.action === 'wake') {
+    const broadcastAddress = getSetting(ctx.db, 'wol_broadcast', '255.255.255.255');
+    for (const client of clients) {
+      try {
+        await sendWakeOnLan(client.mac, { broadcastAddress });
+      } catch (err) {
+        failures += 1;
+      }
+    }
+  } else {
+    for (const client of clients) {
+      try {
+        await resetClient(ctx, client.id, { force: true });
+      } catch (err) {
+        failures += 1;
+        logEvent(ctx.db, {
+          action: 'scheduler.window_reset.failed',
+          clientId: client.id,
+          after: { window: window.id, error: err.message },
+        });
+        fireWebhook(ctx, 'reset_failed', { client: client.name, window: window.id, error: err.message });
+      }
+    }
+  }
+  logEvent(ctx.db, {
+    action: 'scheduler.maintenance_window',
+    after: { window: window.id, tag: window.tag, action: window.action, count: clients.length, failures },
   });
+}
+
+function startScheduler(ctx) {
+  const run = () => runNightlyReset(ctx).catch((err) => {
+    console.error('[scheduler] nightly reset run crashed:', err);
+  });
+  let task = cron.schedule(resolveCronExpr(ctx), run);
+  let windowTasks = [];
+
+  function scheduleWindows() {
+    for (const t of windowTasks) t.stop();
+    windowTasks = [];
+    for (const w of listMaintenanceWindows(ctx.db)) {
+      if (!cron.validate(w.cron)) {
+        console.error(`[scheduler] maintenance window ${w.id} has invalid cron "${w.cron}"; skipped`);
+        continue;
+      }
+      windowTasks.push(cron.schedule(w.cron, () => {
+        runMaintenanceWindow(ctx, w).catch((err) => {
+          console.error(`[scheduler] maintenance window ${w.id} crashed:`, err);
+        });
+      }));
+    }
+  }
+  scheduleWindows();
 
   // Editing nightly_reset_cron in Settings would otherwise silently do
   // nothing until the process restarts (node-cron reads the expression once
-  // at schedule() time). The settings route calls this after a cron change.
+  // at schedule() time). The settings route calls this after a cron change;
+  // the maintenance-window routes call rescheduleWindows on CRUD the same way.
   function reschedule() {
     task.stop();
-    task = cron.schedule(resolveCronExpr(ctx), () => {
-      runNightlyReset(ctx).catch((err) => {
-        console.error('[scheduler] nightly reset run crashed:', err);
-      });
-    });
+    task = cron.schedule(resolveCronExpr(ctx), run);
     console.log('[scheduler] nightly_reset_cron changed; rescheduled');
   }
 
   function stop() {
     task.stop();
+    for (const t of windowTasks) t.stop();
   }
 
-  return { stop, reschedule };
+  return { stop, reschedule, rescheduleWindows: scheduleWindows };
 }
 
-module.exports = { startScheduler };
+module.exports = { startScheduler, runMaintenanceWindow };

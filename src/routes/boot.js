@@ -1,7 +1,9 @@
 const express = require('express');
 
 const { normalizeMac, fromHexHyp } = require('../services/mac');
-const { renderBootScript, renderUnknownScript, renderGoldenBuildScript } = require('../services/ipxeTemplate');
+const {
+  renderBootScript, renderUnknownScript, renderGoldenBuildScript, renderGoldenBootScript,
+} = require('../services/ipxeTemplate');
 const {
   getClientByMac,
   updateClient,
@@ -21,6 +23,36 @@ function ipxe(res, body) {
 
 function createBootRouter(ctx) {
   const router = express.Router();
+
+  // Heartbeat contract for the golden image's disk-offline safety script:
+  // its SYSTEM scheduled task POSTs { safety_script_ran: true } here at
+  // startup. Unauthenticated by necessity (the machine has no credentials at
+  // boot), same trust boundary as the rest of /boot/* — the only effect is a
+  // timestamp on an already-known MAC, so the worst a LAN attacker can do is
+  // suppress a warning badge. A booted client with no recent heartbeat gets
+  // flagged in the UI: the safety script may not have run.
+  router.post('/boot/:mac/heartbeat', (req, res) => {
+    try {
+      let mac;
+      try {
+        mac = normalizeMac(req.params.mac);
+      } catch (e) {
+        return res.status(400).json({ error: 'malformed MAC' });
+      }
+      const client = getClientByMac(ctx.db, mac);
+      if (!client) return res.status(404).json({ error: 'unknown client' });
+      updateClient(ctx.db, client.id, { last_heartbeat_at: new Date().toISOString() });
+      logEvent(ctx.db, {
+        action: 'client.heartbeat',
+        clientId: client.id,
+        after: { safety_script_ran: !!(req.body && req.body.safety_script_ran) },
+      });
+      return res.status(200).json({ ok: true });
+    } catch (err) {
+      console.error('heartbeat route error:', err);
+      return res.status(500).json({ error: 'internal error' });
+    }
+  });
 
   router.get('/boot/:macfile', (req, res) => {
     try {
@@ -42,27 +74,40 @@ function createBootRouter(ctx) {
       const buildSession = getActiveGoldenBuildSession(ctx.db);
       if (buildSession && buildSession.mac === mac) {
         const settings = getAllSettings(ctx.db);
-        const winpeChainUrl = settings.winpe_chain_url;
-        if (!winpeChainUrl) {
-          // arm() rejects when winpe_chain_url is unset, but it could have been
-          // cleared after arming — never emit a script with a blank chain target.
-          logEvent(ctx.db, {
-            action: 'boot.golden_build_serve.error',
-            after: { mac, session_id: buildSession.id, error: 'winpe_chain_url unset' },
+        let script;
+        if (buildSession.phase === 'boot_installed') {
+          // Post-install phase: the image is applied and bcdboot has run —
+          // the machine must now sanboot the installed OS from the golden
+          // zvol itself. Serving WinPE again here is exactly the wrong-phase
+          // bug that used to need a manual static-file override.
+          script = renderGoldenBootScript({
+            settings,
+            truenasHost: ctx.config.truenasHost,
+            goldenZvol: ctx.config.goldenZvol,
           });
-          return ipxe(res, '#!ipxe\necho Golden Build Mode armed but winpe_chain_url is unset in FleetDeck\nshell\n');
+        } else {
+          const winpeChainUrl = settings.winpe_chain_url;
+          if (!winpeChainUrl) {
+            // arm() rejects when winpe_chain_url is unset, but it could have
+            // been cleared after arming — never emit a blank chain target.
+            logEvent(ctx.db, {
+              action: 'boot.golden_build_serve.error',
+              after: { mac, session_id: buildSession.id, error: 'winpe_chain_url unset' },
+            });
+            return ipxe(res, '#!ipxe\necho Golden Build Mode armed but winpe_chain_url is unset in FleetDeck\nshell\n');
+          }
+          script = renderGoldenBuildScript({
+            settings,
+            truenasHost: ctx.config.truenasHost,
+            goldenZvol: ctx.config.goldenZvol,
+            winpeChainUrl,
+          });
         }
-        const script = renderGoldenBuildScript({
-          settings,
-          truenasHost: ctx.config.truenasHost,
-          goldenZvol: ctx.config.goldenZvol,
-          winpeChainUrl,
-        });
         // Distinct from boot.serve: this is a meaningfully different (and more
         // consequential) thing to have happened than a normal client boot.
         logEvent(ctx.db, {
           action: 'boot.golden_build_serve',
-          after: { mac, session_id: buildSession.id },
+          after: { mac, session_id: buildSession.id, phase: buildSession.phase || 'install' },
         });
         return ipxe(res, script);
       }

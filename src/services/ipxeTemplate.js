@@ -49,11 +49,22 @@ function goldenTargetName(goldenZvol) {
   return String(goldenZvol || '').split('/').pop();
 }
 
-// Golden Build Mode boot script. Unlike renderBootScript (sanboot into a
-// per-client clone), this sanhooks the machine directly onto the live golden
-// zvol as a local disk and chains into WinPE to service it in place — so
-// anything written lands permanently on the golden image. `keep-san 1` keeps
-// the iSCSI connection alive across the chain so WinPE sees drive 0x80.
+// Golden Build Mode 'boot_installed'-phase script: after the image has been
+// applied and bcdboot has run, the machine must boot the installed OS
+// directly from the golden zvol — a plain sanboot, no WinPE. This is what
+// previously required a manual static-file override on the old ipxeboot
+// container the moment the install finished.
+function renderGoldenBootScript({ settings, truenasHost, goldenZvol }) {
+  const iqnPrefix = resolveIqnPrefix(settings);
+  const target = goldenTargetName(goldenZvol);
+  return defaultScript({ target, host: truenasHost, iqnPrefix });
+}
+
+// Golden Build Mode 'install'-phase script. Unlike renderBootScript (sanboot
+// into a per-client clone), this sanhooks the machine directly onto the live
+// golden zvol as a local disk and chains into WinPE to service it in place —
+// so anything written lands permanently on the golden image. `keep-san 1`
+// keeps the iSCSI connection alive across the chain so WinPE sees drive 0x80.
 // Host / IQN-prefix / golden-target resolution match renderBootScript's.
 function renderGoldenBuildScript({ settings, truenasHost, goldenZvol, winpeChainUrl }) {
   const iqnPrefix = resolveIqnPrefix(settings);
@@ -78,5 +89,5 @@ function renderUnknownScript(mac) {
 
 module.exports = {
   renderBootScript, renderUnknownScript, renderGoldenBuildScript,
-  goldenTargetName, DEFAULT_IQN_PREFIX,
+  renderGoldenBootScript, goldenTargetName, DEFAULT_IQN_PREFIX,
 };

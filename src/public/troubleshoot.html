@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Machine troubleshooting</title>
+<!-- Static, unauthenticated guest-facing page: the per-client QR codes in
+     FleetDeck point here. Keep it generic — no machine-specific data beyond
+     the optional ?m= display name, which is cosmetic. -->
+<style>
+  body { margin: 0; background: #111; color: #ddd; font: 16px/1.6 system-ui, sans-serif;
+    display: flex; justify-content: center; padding: 24px; }
+  main { max-width: 560px; }
+  h1 { font-size: 20px; color: #2fd6c6; letter-spacing: 1px; }
+  h2 { font-size: 15px; margin-top: 22px; color: #d9a441; }
+  li { margin-bottom: 6px; }
+  .machine { color: #2fd6c6; font-family: ui-monospace, monospace; }
+  @media print { body { background: #fff; color: #000; } h1 { color: #000; } h2 { color: #000; } .machine { color: #000; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>MACHINE TROUBLESHOOTING <span class="machine" id="mname"></span></h1>
+
+  <h2>Screen is black / machine seems off</h2>
+  <ul>
+    <li>Press the power button once and wait ~60 seconds — network boot takes longer than a normal PC.</li>
+    <li>Check the monitor input (HDMI/DisplayPort) and that the monitor is on.</li>
+  </ul>
+
+  <h2>Stuck on a boot screen or an error about the network</h2>
+  <ul>
+    <li>Hold the power button 5 seconds to turn it off, wait 10 seconds, power on again.</li>
+    <li>Check the network cable is clicked in at both the wall and the machine.</li>
+  </ul>
+
+  <h2>Windows is slow or broken</h2>
+  <ul>
+    <li>These machines reset to a clean image on reboot — save anything you need somewhere else, then just restart the machine.</li>
+  </ul>
+
+  <h2>Still stuck?</h2>
+  <ul>
+    <li>Ask a staff member — mention the machine name shown above (also printed on the sticker).</li>
+  </ul>
+</main>
+<script>
+  var m = new URLSearchParams(location.search).get('m');
+  if (m) document.getElementById('mname').textContent = '— ' + m;
+</script>
+</body>
+</html>
