@@ -81,42 +81,48 @@ function startReconnectLoop(ctx, holder) {
   let backoffMs = RECONNECT_MIN_MS;
   let stopped = false;
   let timer = null;
+  let attemptCount = 0;
 
-  // ctx.push is attached after app.listen(), later than this loop starts —
-  // read it live and tolerate its absence (an early state change before the
-  // channel exists has no tabs to tell anyway; each new socket is greeted
-  // with the current state on connect).
-  function pushState(connected) {
-    if (ctx.push) ctx.push.broadcast('truenas', { connected });
+  // Connection state surfaced to the UI (item 42/43): the sidebar health dot
+  // distinguishes "connected" (green), "reconnecting" (yellow, with attempt
+  // count + next-retry countdown so a recovering box reads as recovering,
+  // not broken) and "down". Read live off ctx by /api/system/connection and
+  // pushed on every transition.
+  function setConn(state, extra = {}) {
+    ctx.connState = { state, attempt: attemptCount, ...extra };
+    if (ctx.push) ctx.push.broadcast('truenas', { connected: state === 'connected', ...ctx.connState });
   }
+  ctx.connState = { state: ctx.adapter ? 'connected' : 'reconnecting', attempt: 0 };
 
   function onDisconnected() {
     if (stopped) return;
     console.error('[server] TrueNAS connection dropped; will retry with backoff');
     ctx.adapter = null;
-    pushState(false);
     scheduleAttempt();
   }
 
   async function attempt() {
     if (stopped) return;
+    attemptCount += 1;
     try {
       const { client, adapter } = await connectTrueNAS(ctx.config);
       holder.client = client;
       ctx.adapter = adapter;
       backoffMs = RECONNECT_MIN_MS;
+      attemptCount = 0;
       console.log('[server] TrueNAS (re)connected and resolved RPC methods');
-      pushState(true);
+      setConn('connected');
       client.on('disconnected', onDisconnected);
     } catch (err) {
       console.error(`[server] TrueNAS reconnect attempt failed: ${err.message}`);
-      scheduleAttempt();
+      scheduleAttempt(err.message);
     }
   }
 
-  function scheduleAttempt() {
+  function scheduleAttempt(lastError = null) {
     if (stopped) return;
     clearTimeout(timer);
+    setConn('reconnecting', { nextRetryAt: new Date(Date.now() + backoffMs).toISOString(), lastError });
     timer = setTimeout(attempt, backoffMs);
     backoffMs = Math.min(backoffMs * 2, RECONNECT_MAX_MS);
   }
@@ -232,7 +238,11 @@ async function main() {
         }
         clientId = parsed;
       }
-      return res.status(200).json(listEvents(db, { limit, clientId }));
+      // Audit-tab server-side filters (item 44): action prefix + date range.
+      const action = typeof req.query.action === 'string' && req.query.action ? req.query.action : null;
+      const from = typeof req.query.from === 'string' && req.query.from ? req.query.from : null;
+      const to = typeof req.query.to === 'string' && req.query.to ? req.query.to : null;
+      return res.status(200).json(listEvents(db, { limit, clientId, action, from, to }));
     } catch (err) {
       return res.status(500).json({ error: err.message });
     }

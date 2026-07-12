@@ -29,8 +29,10 @@ WORKDIR /app
 COPY --from=builder /app/node_modules ./node_modules
 COPY package.json package-lock.json ./
 
-# Application source.
+# Application source. CHANGELOG.md is read at runtime by the "what's new"
+# panel, so it must be in the image, not just the repo.
 COPY src ./src
+COPY CHANGELOG.md ./CHANGELOG.md
 
 # Build provenance shown in Settings and /api/system/info. Pass at build time:
 #   docker build --build-arg GIT_COMMIT=$(git rev-parse HEAD) \

@@ -250,3 +250,15 @@ e.g. from the safety `.ps1`: `Invoke-RestMethod -Method Post -Uri "http://192.16
 **API-key rotation.** TrueNAS doesn't expose API-key creation dates, so set `api_key_created_at` (e.g. `2026-07-01`) when you create/rotate the key; Settings shows a banner once it exceeds `api_key_max_age_days` (default 180).
 
 **Build provenance.** `GIT_COMMIT` and `BUILD_DATE` (Docker build args, baked to env) show in Settings and `/api/system/info`.
+
+---
+
+## 8. Reliability & observability
+
+- **Live audit tail**: the Audit tab streams new events over the WebSocket with severity coloring (failures red, warnings amber), plus server-side filters (action prefix, date range) so large histories filter on the server, not the browser.
+- **Connection health**: a dot in the sidebar (visible on every tab) shows the TrueNAS connection — green connected, amber *reconnecting* with the attempt count and a live "retry in Ns" countdown (so a recovering box reads as recovering, not broken), red down.
+- **Per-client last error**: a ⚠ icon on each dashboard row surfaces that client's most recent failed audit event on hover, instead of it being buried in the Audit tab.
+- **Self-test**: Settings → *Run self-test* re-runs the same checks as the Setup-tab Diagnostics (TrueNAS connectivity, golden zvol/target groups, `_safety`, boot files, ranged HTTP self-fetch, TFTP self-read).
+- **Config warnings**: Settings surfaces recommended-but-unset configuration (no webhook, API-key age tracking off, WoL broadcast mismatch, DRY_RUN armed) instead of leaving it to the console at boot.
+- **DRY_RUN banner**: a persistent, high-contrast banner rides above every tab whenever `DRY_RUN=1`.
+- **What's new**: `CHANGELOG.md` is parsed into a Settings panel with a per-admin unread indicator (last-seen version stored on the account, so it follows the operator across machines rather than relying on browser storage).

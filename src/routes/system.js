@@ -7,7 +7,47 @@ const path = require('path');
 const Database = require('better-sqlite3');
 
 const pkg = require('../../package.json');
-const { listClients, listPoolHistory, logEvent } = require('../db');
+const {
+  listClients, listPoolHistory, logEvent, getSetting,
+  latestErrorPerClient, getAdminByUsername, setAdminLastSeenVersion,
+} = require('../db');
+const { runDiagnostics } = require('../services/setupWizard');
+const { tftpFetch } = require('../services/tftp');
+const { KNOWN_EVENTS } = require('../services/webhook');
+
+// Recommended-but-optional configuration that isn't wrong to leave unset but
+// is worth surfacing (item 47). Evaluated live against current settings/env.
+function configWarnings(ctx) {
+  const warn = [];
+  const s = (k, d = '') => getSetting(ctx.db, k, d);
+  if (!s('webhook_url')) warn.push({ key: 'webhook_url', text: 'No webhook configured — pool/reset/nightly alerts are only in the audit log.' });
+  if (!s('api_key_created_at')) warn.push({ key: 'api_key_created_at', text: 'API-key age tracking is off (set api_key_created_at to enable the rotation reminder).' });
+  if (s('wol_enabled', '0') === '1' && s('wol_broadcast', '255.255.255.255') === '255.255.255.255') {
+    warn.push({ key: 'wol_broadcast', text: 'WoL is enabled but wol_broadcast is the limited broadcast — on bridge networking this never reaches the LAN.' });
+  }
+  if (!s('golden_snapshot')) warn.push({ key: 'golden_snapshot', text: 'No default golden snapshot set — new clients use the highest gold-vN found at runtime.' });
+  if (ctx.config.dryRun) warn.push({ key: 'DRY_RUN', text: 'DRY_RUN=1 — TrueNAS mutations are disabled. Arm the system by setting DRY_RUN=0 once introspection looks right.' });
+  return warn;
+}
+
+// CHANGELOG.md is bundled with the app; parse the "## <version>" sections into
+// entries for the Settings "what's new" panel (item 50).
+function parseChangelog() {
+  try {
+    const raw = fs.readFileSync(path.join(__dirname, '..', '..', 'CHANGELOG.md'), 'utf8');
+    const entries = [];
+    const re = /^##\s+(.+?)\s*$/gm;
+    let m; const marks = [];
+    while ((m = re.exec(raw)) !== null) marks.push({ version: m[1].trim(), start: m.index, bodyStart: re.lastIndex });
+    for (let i = 0; i < marks.length; i += 1) {
+      const end = i + 1 < marks.length ? marks[i + 1].start : raw.length;
+      entries.push({ version: marks[i].version, body: raw.slice(marks[i].bodyStart, end).trim() });
+    }
+    return entries;
+  } catch (_) {
+    return [];
+  }
+}
 
 // Tables a restore copies, in dependency order. Older backups may lack the
 // newer tables (initDb migrations recreate them empty) — only CORE_TABLES
@@ -84,6 +124,71 @@ function createSystemRouter(ctx) {
       buildDate: process.env.BUILD_DATE || null,
       adminUser: req.adminUser || null,
     });
+  });
+
+  // Live TrueNAS connection state + reconnect progress (items 42/43).
+  router.get('/api/system/connection', (req, res) => {
+    return res.status(200).json(ctx.connState || { state: ctx.adapter ? 'connected' : 'down', attempt: 0 });
+  });
+
+  router.get('/api/system/warnings', (req, res) => {
+    try {
+      return res.status(200).json(configWarnings(ctx));
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  });
+
+  // On-demand self-test (item 46): reuses the same checks the Setup-tab
+  // diagnostics runs (TrueNAS connectivity, golden zvol/target groups,
+  // _safety dataset, boot files, HTTP/TFTP self-fetch) — one source of truth.
+  router.get('/api/system/self-test', async (req, res) => {
+    try {
+      return res.status(200).json({ checks: await runDiagnostics(ctx, { tftpFetch }) });
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  });
+
+  // "What's new" (item 50). unreadSince = the version this admin last saw
+  // (stored per-account in the admins table, not browser storage, so it
+  // follows the operator across machines). Legacy env-password login has no
+  // account row, so it simply always sees the latest as "read".
+  router.get('/api/system/changelog', (req, res) => {
+    try {
+      const entries = parseChangelog();
+      let lastSeen = null;
+      const admin = req.adminUser ? getAdminByUsername(ctx.db, req.adminUser) : null;
+      if (admin) lastSeen = admin.last_seen_version;
+      const latest = entries[0] ? entries[0].version : null;
+      return res.status(200).json({ entries, lastSeen, latest, unread: !!(latest && lastSeen !== latest) });
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  });
+
+  router.post('/api/system/changelog/seen', (req, res) => {
+    try {
+      const entries = parseChangelog();
+      const latest = entries[0] ? entries[0].version : null;
+      if (latest && req.adminUser && getAdminByUsername(ctx.db, req.adminUser)) {
+        setAdminLastSeenVersion(ctx.db, req.adminUser, latest);
+      }
+      return res.status(200).json({ ok: true, latest });
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Most-recent failure per client, for the inline last-error row icon.
+  // NB: NOT under /api/clients/* — that path is owned by the clients router's
+  // /api/clients/:id, which would capture "errors" as an id and 404.
+  router.get('/api/client-errors', (req, res) => {
+    try {
+      return res.status(200).json(latestErrorPerClient(ctx.db));
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
   });
 
   router.get('/api/pool/history', (req, res) => {

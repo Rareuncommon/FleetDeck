@@ -149,7 +149,12 @@ const state = {
   loadedClientsOnce: false,   // gates the skeleton row rendering
   wsConnected: false,
   truenasConnected: null,     // null until the first ws greeting
+  connState: null,            // { state, attempt, nextRetryAt, lastError }
+  dryRun: false,
   goldenBuild: null,          // active golden build session row, or null
+  clientErrors: {},           // clientId -> last failed audit event
+  auditFilter: { action: "", from: "", to: "" },
+  auditLive: true,
 };
 const PER_PAGE = 50;
 
@@ -183,11 +188,13 @@ function connectWS() {
     } else if (msg.type === "truenas") {
       const was = state.truenasConnected;
       state.truenasConnected = !!(msg.payload && msg.payload.connected);
+      state.connState = msg.payload || null;
       // Only announce transitions, not the greeting a fresh tab receives.
       if (was !== null && was !== state.truenasConnected) {
         toast(state.truenasConnected ? "TrueNAS reconnected" : "TrueNAS connection lost", state.truenasConnected ? "ok" : "err");
       }
       renderStamp();
+      renderConnHealth();
     }
   });
   ws.addEventListener("close", () => {
@@ -200,10 +207,22 @@ function connectWS() {
   ws.addEventListener("error", () => { try { ws.close(); } catch (e) {} });
 }
 
+function auditEventMatches(evt) {
+  const f = state.auditFilter;
+  if (f.action && !String(evt.action || "").startsWith(f.action)) return false;
+  // Date filters are coarse (day granularity); a live event is "now", so it
+  // only shows when the range has no upper bound in the past.
+  if (f.to && new Date(evt.ts || Date.now()) > new Date(new Date(f.to).setHours(23, 59, 59, 999))) return false;
+  return true;
+}
+
 function onPushedEvent(evt) {
   if (!evt) return;
-  // Live-prepend on the Audit tab if it's showing.
-  if ($("#events").classList.contains("active")) prependEventRow(evt);
+  // Live-tail on the Audit tab (item 41): only when enabled and the event
+  // passes the active filter, so the tail respects what you're looking at.
+  if (state.auditLive && $("#events").classList.contains("active") && auditEventMatches(evt)) {
+    prependEventRow(evt);
+  }
   // Refresh an open drawer if the event concerns that client.
   if (drawerClientId != null && evt.client_id === drawerClientId) refreshDrawerEvents();
   // Discovered machines only surface via boot.* audit entries — refresh the
@@ -214,8 +233,51 @@ function onPushedEvent(evt) {
 function renderStamp() {
   const bits = [];
   bits.push(state.wsConnected ? "live" : "polling");
-  if (state.truenasConnected === false) bits.push("truenas down");
   $("#poll-stamp").textContent = bits.join(" · ") + " · " + new Date().toLocaleTimeString();
+}
+
+// Sidebar connection-health dot (items 42/43): green connected, amber
+// reconnecting (with attempt count + a live "next retry in Ns" so recovery
+// reads as recovery, not failure), red down.
+function renderConnHealth() {
+  const root = $("#conn-health");
+  if (!root) return;
+  const c = state.connState;
+  let cls = "down", text = "TrueNAS down", tip = "No TrueNAS connection";
+  if (state.truenasConnected) {
+    cls = "connected"; text = "TrueNAS connected"; tip = "RPC connection healthy";
+  } else if (c && c.state === "reconnecting") {
+    cls = "reconnecting";
+    let secs = "";
+    if (c.nextRetryAt) {
+      const d = Math.max(0, Math.round((new Date(c.nextRetryAt) - Date.now()) / 1000));
+      secs = `, retry in ${d}s`;
+    }
+    text = `reconnecting (#${c.attempt || 1})`;
+    tip = `Reconnecting to TrueNAS — attempt ${c.attempt || 1}${secs}${c.lastError ? `\nlast error: ${c.lastError}` : ""}`;
+  }
+  root.className = "conn " + cls;
+  root.title = tip;
+  root.querySelector(".conn-text").textContent = text;
+}
+
+async function refreshConnHealth() {
+  try {
+    state.connState = await api("GET", "/api/system/connection");
+    state.truenasConnected = state.connState.state === "connected";
+  } catch (e) {}
+  renderConnHealth();
+}
+
+function renderDryRunBanner() {
+  const el2 = $("#dryrun-banner");
+  if (!el2) return;
+  if (state.dryRun) {
+    el2.style.display = "";
+    el2.textContent = "⚠ DRY_RUN — TrueNAS mutations are disabled. FleetDeck logs what it would do but changes nothing.";
+  } else {
+    el2.style.display = "none";
+  }
 }
 
 /* ========================= Client table ================================= */
@@ -241,6 +303,16 @@ function visibleClients() {
     });
   }
   return list;
+}
+
+// Inline last-error marker (item 45): most recent failed audit event for the
+// client, hover for detail, sourced from /api/client-errors rather than
+// buried in the Audit tab.
+function lastErrorIcon(clientId) {
+  const e = state.clientErrors[clientId];
+  if (!e) return "";
+  const when = (e.ts || "").replace("T", " ").slice(0, 19);
+  return ` <span class="err-icon" title="${esc(e.action)} — ${esc(when)}">⚠</span>`;
 }
 
 function statusBadge(status) {
@@ -273,7 +345,7 @@ function renderClients() {
       `<option${g === c.golden_snapshot ? " selected" : ""}>${esc(g)}</option>`).join("");
     tr.innerHTML = `
       <td data-th=""><input type="checkbox" class="sel" value="${c.id}"${state.selected.has(String(c.id)) ? " checked" : ""}></td>
-      <td data-th="Name">${esc(c.name)}</td>
+      <td data-th="Name">${esc(c.name)}${lastErrorIcon(c.id)}</td>
       <td data-th="MAC" class="mono">${esc(c.mac)}</td>
       <td data-th="Zvol" class="mono muted">${esc(c.zvol)}</td>
       <td data-th="Golden" class="mono badge">${esc(c.golden_snapshot)}</td>
@@ -357,6 +429,7 @@ async function loadClients() {
   try {
     state.clients = await api("GET", "/api/clients");
     state.loadedClientsOnce = true;
+    try { state.clientErrors = await api("GET", "/api/client-errors"); } catch (e) {}
     renderClients();
     renderStamp();
   } catch (e) {}
@@ -1538,6 +1611,47 @@ async function loadSettings() {
   loadSystemInfo(merged);
   loadWindows();
   loadAdmins();
+  loadConfigWarnings();
+  loadChangelog();
+}
+
+async function loadConfigWarnings() {
+  let warns = [];
+  try { warns = await api("GET", "/api/system/warnings"); } catch (e) { return; }
+  const root = $("#config-warnings");
+  root.innerHTML = warns.length
+    ? warns.map((w) => `<div class="selftest-row"><span class="tag warn-hb">${esc(w.key)}</span><span class="muted">${esc(w.text)}</span></div>`).join("")
+    : '<div class="muted">No configuration warnings.</div>';
+}
+
+$("#self-test").addEventListener("click", async () => {
+  const root = $("#self-test-results");
+  root.innerHTML = '<div class="muted">Running…</div>';
+  try {
+    const r = await api("GET", "/api/system/self-test");
+    root.innerHTML = (r.checks || []).map((c) => `
+      <div class="selftest-row">
+        <span class="tag ${c.ok ? (c.warn ? "warn-hb" : "toggle-on") : ""}" style="${c.ok ? "" : "color:var(--red);border-color:var(--red)"}">${c.ok ? (c.warn ? "warn" : "pass") : "fail"}</span>
+        <span class="mono muted" style="min-width:110px">${esc(c.id)}</span>
+        <span style="flex:1">${esc(c.detail)}</span>
+      </div>`).join("");
+  } catch (err) { root.innerHTML = `<div class="msg err">${esc(err.message)}</div>`; }
+});
+
+async function loadChangelog() {
+  let r = null;
+  try { r = await api("GET", "/api/system/changelog"); } catch (e) { return; }
+  const root = $("#changelog");
+  root.innerHTML = (r.entries || []).map((e, i) => `
+    <div style="margin-bottom:10px">
+      <div><b class="${e.version === r.latest && r.unread ? "" : ""}">${esc(e.version)}</b>${e.version === r.latest && r.unread ? ' <span class="tag warn-hb">new since your last visit</span>' : ""}</div>
+      <div class="muted" style="white-space:pre-wrap;font-size:12px">${esc(e.body)}</div>
+    </div>`).join("");
+  $("#changelog-unread").style.display = r.unread ? "" : "none";
+  // Mark seen when the panel is viewed (a named admin remembers this).
+  if (r.unread) {
+    try { await api("POST", "/api/system/changelog/seen"); } catch (e) {}
+  }
 }
 
 async function loadSystemInfo(settings) {
@@ -1695,8 +1809,16 @@ $("#test-connection").addEventListener("click", async () => {
 
 /* ============================= Audit tab ================================ */
 
+// Severity from the action name: failures red, warnings amber, else default.
+function eventSeverity(action) {
+  const a = String(action || "");
+  if (/fail|error|rollback/i.test(a)) return "ev-error";
+  if (/warn|unknown/i.test(a)) return "ev-warn";
+  return "";
+}
+
 function eventRow(ev) {
-  const tr = el("tr");
+  const tr = el("tr", { className: eventSeverity(ev.action) });
   tr.innerHTML = `<td class="mono muted">${esc((ev.ts || "").toString().replace("T", " ").slice(0, 19))}</td>
     <td><span class="tag">${esc(ev.action)}</span></td><td>${esc(ev.client_id == null ? "—" : ev.client_id)}</td>
     <td class="muted">${esc(ev.actor || "—")}</td>
@@ -1714,17 +1836,39 @@ function prependEventRow(ev) {
   const [tr, detail] = eventRow(ev);
   body.insertBefore(detail, body.firstChild);
   body.insertBefore(tr, detail);
+  // Bound the live-tail DOM so a long-running tab doesn't grow unbounded.
+  while (body.children.length > 1000) body.removeChild(body.lastChild);
+}
+
+function auditQuery() {
+  const f = state.auditFilter;
+  const q = new URLSearchParams({ limit: "500" });
+  if (f.action) q.set("action", f.action);
+  if (f.from) q.set("from", new Date(f.from).toISOString());
+  if (f.to) { const d = new Date(f.to); d.setHours(23, 59, 59, 999); q.set("to", d.toISOString()); }
+  return q.toString();
 }
 
 async function loadEvents() {
   let list = [];
-  try { list = await api("GET", "/api/events"); } catch (e) { return; }
+  try { list = await api("GET", "/api/events?" + auditQuery()); } catch (e) { return; }
   const body = $("#events-body"); body.innerHTML = "";
   for (const ev of list) {
     const [tr, detail] = eventRow(ev);
     body.appendChild(tr); body.appendChild(detail);
   }
 }
+
+$("#audit-apply").addEventListener("click", () => {
+  state.auditFilter = { action: $("#audit-action").value.trim(), from: $("#audit-from").value, to: $("#audit-to").value };
+  loadEvents();
+});
+$("#audit-clear").addEventListener("click", () => {
+  state.auditFilter = { action: "", from: "", to: "" };
+  $("#audit-action").value = ""; $("#audit-from").value = ""; $("#audit-to").value = "";
+  loadEvents();
+});
+$("#audit-live").addEventListener("change", (e) => { state.auditLive = e.target.checked; });
 
 /* ========================== Command palette ============================= */
 
@@ -1867,6 +2011,7 @@ async function boot() {
     showApp();
     state.clients = list;
     state.loadedClientsOnce = true;
+    try { state.clientErrors = await api("GET", "/api/client-errors"); } catch (e) {}
     try {
       const snaps = await api("GET", "/api/golden/snapshots");
       state.goldenNames = snaps.map((s) => s.name);
@@ -1877,6 +2022,16 @@ async function boot() {
     await loadPoolHistory();
     renderStatTiles(await loadPoolStatus());
     renderStamp();
+    // System info: DRY_RUN banner + build-provenance footer (items 48/49).
+    try {
+      const info = await api("GET", "/api/system/info");
+      state.dryRun = !!info.dryRun;
+      renderDryRunBanner();
+      if (info.gitCommit || info.buildDate) {
+        $("#build-stamp").textContent = [info.gitCommit ? info.gitCommit.slice(0, 8) : "", info.buildDate || ""].filter(Boolean).join(" · ");
+      }
+    } catch (e) {}
+    refreshConnHealth();
     loadDiscovered();
     connectWS();
     // Golden Build status is fetched globally (cheap) so the Golden-tab banner
@@ -1887,6 +2042,8 @@ async function boot() {
     // 1s countdown re-render (text only) while a session is active.
     if (!goldenBuildCountdown) goldenBuildCountdown = setInterval(() => {
       if (state.goldenBuild) renderGoldenBuildBanner();
+      // Live "retry in Ns" countdown on the connection dot while reconnecting.
+      if (state.connState && state.connState.state === "reconnecting") renderConnHealth();
     }, 1000);
     // Polling fallback: only fetch when the live channel is down; pool usage
     // (no WS message for it) still refreshes on a slow multiple of the tick.

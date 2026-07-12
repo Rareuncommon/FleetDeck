@@ -141,6 +141,24 @@ tr.in-use td:first-child { border-left: 3px solid var(--accent); }
   animation: pulse 2s ease-in-out infinite; }
 .tag.warn-hb { color: var(--amber); border-color: var(--amber); }
 
+/* ---- DRY_RUN banner (persistent, every tab) ---- */
+#dryrun-banner { background: repeating-linear-gradient(45deg, rgba(217,164,65,.15), rgba(217,164,65,.15) 12px, rgba(217,164,65,.08) 12px, rgba(217,164,65,.08) 24px);
+  border-bottom: 1px solid var(--amber); color: var(--amber); font-weight: 600;
+  text-align: center; padding: 5px; font-size: 12px; letter-spacing: .5px; }
+
+/* ---- Sidebar connection-health dot ---- */
+.conn { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--dim); cursor: default; }
+.conn .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--gray); flex: 0 0 auto; }
+.conn.connected .dot { background: var(--green); box-shadow: 0 0 5px var(--green); }
+.conn.reconnecting .dot { background: var(--amber); animation: pulse 1.2s ease-in-out infinite; }
+.conn.down .dot { background: var(--red); }
+
+/* ---- Audit severity + last-error icon ---- */
+tr.ev-error td { color: var(--red); }
+tr.ev-warn td { color: var(--amber); }
+.err-icon { color: var(--red); cursor: help; margin-left: 4px; }
+.selftest-row { display: flex; gap: 8px; padding: 3px 0; align-items: baseline; }
+
 /* ---- Golden Build Mode active-session banner ----
    Full-width, amber, impossible to miss: when it's showing, the live golden
    image is writable by a booted machine and every future clone inherits

@@ -18,6 +18,9 @@
 <body>
 
 <div id="app" style="display:none">
+  <!-- Persistent DRY_RUN banner (item 48): a safety-relevant state that must
+       never be easy to lose track of, so it rides above every tab. -->
+  <div id="dryrun-banner" style="display:none"></div>
   <!-- Mobile-only top bar; the sidebar collapses off-canvas below 700px -->
   <div class="topbar">
     <button class="burger" id="burger" aria-label="Menu">&#9776;</button>
@@ -49,7 +52,9 @@
     </nav>
     <div class="spacer"></div>
     <div class="foot">
+      <div id="conn-health" class="conn" title="TrueNAS connection"><span class="dot"></span><span class="conn-text">…</span></div>
       <span id="poll-stamp" class="mono"></span>
+      <span id="build-stamp" class="mono muted"></span>
       <button id="logout">Logout</button>
     </div>
   </aside>
@@ -213,6 +218,15 @@
         <h2 style="margin-top:0">System</h2>
         <div id="system-info" class="row"></div>
         <div id="apikey-banner"></div>
+        <div id="config-warnings" style="margin-top:8px"></div>
+        <div class="row" style="margin-top:10px">
+          <button id="self-test" class="accent">Run self-test</button>
+        </div>
+        <div id="self-test-results" style="margin-top:8px"></div>
+      </div>
+      <div class="panel">
+        <h2 style="margin-top:0">What's new <span id="changelog-unread" class="tag" style="display:none;color:var(--amber);border-color:var(--amber)">new</span></h2>
+        <div id="changelog"></div>
       </div>
       <div class="panel">
         <h2 style="margin-top:0">Maintenance windows (per-tag schedules)</h2>
@@ -252,7 +266,14 @@
     </section>
 
     <section id="events">
-      <div class="row" style="margin-bottom:8px">
+      <div class="toolbar">
+        <input id="audit-action" placeholder="action prefix (e.g. client.)" class="mono" style="width:180px">
+        <input id="audit-from" type="date" title="from date">
+        <input id="audit-to" type="date" title="to date">
+        <button id="audit-apply" class="accent">Filter</button>
+        <button id="audit-clear">Clear</button>
+        <span class="spacer" style="flex:1"></span>
+        <label class="row" style="gap:4px"><input type="checkbox" id="audit-live" checked> live tail</label>
         <button id="export-events">Export JSON</button>
       </div>
       <table>

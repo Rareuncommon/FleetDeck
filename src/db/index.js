@@ -161,14 +161,40 @@ function logEvent(db, { action, clientId = null, before = null, after = null, ac
 }
 
 // clientId filter powers the per-client audit history in the dashboard's
-// detail drawer; the unfiltered form remains the Audit tab's full feed.
-function listEvents(db, { limit = 100, clientId = null } = {}) {
-  if (clientId != null) {
-    return db.prepare(
-      'SELECT * FROM events WHERE client_id = ? ORDER BY id DESC LIMIT ?'
-    ).all(clientId, limit);
-  }
-  return db.prepare('SELECT * FROM events ORDER BY id DESC LIMIT ?').all(limit);
+// detail drawer; the other filters power the Audit tab's server-side query
+// (item 44) since audit history can grow past what's sane to filter client-
+// side. `action` matches a prefix ("client." catches all client events);
+// from/to are ISO timestamps compared against the ts column.
+function listEvents(db, { limit = 100, clientId = null, action = null, from = null, to = null } = {}) {
+  const where = [];
+  const params = [];
+  if (clientId != null) { where.push('client_id = ?'); params.push(clientId); }
+  if (action) { where.push('action LIKE ?'); params.push(`${action}%`); }
+  if (from) { where.push('ts >= ?'); params.push(from); }
+  if (to) { where.push('ts <= ?'); params.push(to); }
+  const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  params.push(limit);
+  return db.prepare(`SELECT * FROM events ${clause} ORDER BY id DESC LIMIT ?`).all(...params);
+}
+
+// Most recent failure-ish audit event per client, for the inline last-error
+// icon on each dashboard row (item 45). "Failure-ish" = action contains
+// fail/error/rollback. One row per client via a correlated MAX(id).
+function latestErrorPerClient(db) {
+  const rows = db.prepare(
+    `SELECT e.client_id, e.action, e.ts, e.after_json
+       FROM events e
+       WHERE e.client_id IS NOT NULL
+         AND (e.action LIKE '%fail%' OR e.action LIKE '%error%' OR e.action LIKE '%rollback%')
+         AND e.id = (
+           SELECT MAX(e2.id) FROM events e2
+           WHERE e2.client_id = e.client_id
+             AND (e2.action LIKE '%fail%' OR e2.action LIKE '%error%' OR e2.action LIKE '%rollback%')
+         )`
+  ).all();
+  const out = {};
+  for (const r of rows) out[r.client_id] = { action: r.action, ts: r.ts, after: r.after_json };
+  return out;
 }
 
 // The events table has no other retention policy and /boot/* (unauthenticated,
@@ -423,5 +449,6 @@ module.exports = {
   listMaintenanceWindows, insertMaintenanceWindow, deleteMaintenanceWindow,
   listAdmins, getAdminByUsername, insertAdmin, deleteAdmin, countAdmins, setAdminLastSeenVersion,
   insertPoolHistory, lastPoolHistoryAt, listPoolHistory,
+  latestErrorPerClient,
   changes,
 };
