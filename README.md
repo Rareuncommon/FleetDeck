@@ -2,6 +2,8 @@
 
 FleetDeck is a single-container web app that manages a diskless Windows gaming fleet booting over iSCSI from TrueNAS SCALE. It replaces the manual workflow of hand-editing per-client iPXE scripts and clicking through the TrueNAS UI to clone, snapshot, and retire zvols. One dashboard drives the whole fleet: create a client, reset it to golden, rebase it onto a new golden version, retire it, or promote a new golden image — each as a single action, with every TrueNAS mutation recorded in an events log.
 
+> **What's new in v2:** FleetDeck now absorbs the entire bring-up — it serves the boot chain itself (TFTP + HTTP, retiring the separate ipxeboot container), has a first-run Setup Wizard for the TrueNAS side, a guided Golden Build workflow with a generated WinPE deploy script, guest/kiosk features, fleet-ops tooling (tags, webhooks, `/metrics`, backup/restore, multi-admin), and reliability/observability additions. See [CHANGELOG.md](CHANGELOG.md) for the full list and the [deploy runbook](docs/DEPLOY.md) for setup.
+
 ## Features
 
 - **Dashboard** — live view of every client, its zvol clone, iSCSI target, and last boot; updates are pushed over a WebSocket (`/ws`, same session auth) with automatic fallback to polling. Sortable/searchable client table with pagination, bulk actions (reset/retire/rebase/nightly), a per-client detail drawer with audit history and snapshot lineage, and a Cmd/Ctrl+K command palette.
@@ -70,8 +72,12 @@ Set as env vars in the TrueNAS Custom App, or via `.env` for local/compose. See 
 | `GOLDEN_ZVOL` | Zvol path for the golden (sysprepped) image; snapshots `@gold-vN`. | `Main_pool/iscsi/win-golden` |
 | `CLIENT_ZVOL_ROOT` | Root dataset path where per-client clone zvols live. | `Main_pool/iscsi` |
 | `POOL_NAME` | Pool name for capacity alerting. Defaults to `CLIENT_ZVOL_ROOT`'s first path segment. | `Main_pool` |
+| `BOOTFILES_DIR` | Where the served boot chain (wimboot, WinPE media, `snponly.efi`) lives. | `<dir of DB_PATH>/bootfiles` |
+| `TFTP_ENABLED` | `1` = serve TFTP for `snponly.efi` in-process (needs host networking). `0` keeps an external TFTP server. | `1` |
+| `TFTP_PORT` | TFTP UDP port. `69` needs host networking + root. | `69` |
+| `GIT_COMMIT` / `BUILD_DATE` | Optional Docker build args, baked to env and shown in Settings. | (unset) |
 
-A few more tunables live in the in-app Settings panel rather than as env vars (`wol_enabled`, `wol_broadcast`, `pool_alert_threshold_pct`, `safety_snapshot_retention_days`, `nightly_reset_cron`) since they're safe to change at runtime without a restart.
+Many runtime tunables live in the in-app Settings panel rather than as env vars, so they take effect without a restart: WoL (`wol_enabled`, `wol_broadcast`), alerting (`pool_alert_threshold_pct`), retention (`safety_snapshot_retention_days`), schedules (`nightly_reset_cron`), Golden Build (`winpe_chain_url`, `golden_build_default_minutes`, `nic_boot_services`, `golden_image_index`), SMB staging (`bootfiles_host_path`, `bootfiles_smb_share_name`), guest fleet (`guest_idle_timeout_minutes`, `guest_motd`), webhooks (`webhook_url`, `webhook_events`), auth (`session_timeout_minutes`), and API-key hygiene (`api_key_created_at`, `api_key_max_age_days`). See [docs/DEPLOY.md](docs/DEPLOY.md) for what each does.
 
 ### Wake-on-LAN networking
 
